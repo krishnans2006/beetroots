@@ -117,9 +117,7 @@ class Appearance:
             "release_mbid": self.release_id,
             "release_group_mbid": (self.release.get("release-group") or {}).get("id"),
             "album": self.release.get("title"),
-            "album_artists": display_credit(
-                self.release.get("artist-credit"), "joinphrase"
-            ),
+            "album_artists": self.release.get("artist-credit"),
             "release_date": [
                 self.release.get("date"),
                 *(event.get("date") for event in events),
@@ -210,8 +208,7 @@ def version_match(requested: str, title: str, disambiguation: str) -> bool | Non
     if not requested:
         return None
     explicit = text_key(f"{title_qualifiers(title)} {disambiguation}")
-    actual_title = text_key(title)
-    if re.search(rf"\b{re.escape(requested)}\b", f"{actual_title} {explicit}"):
+    if re.search(rf"\b{re.escape(requested)}\b", explicit):
         return True
     requested_types = set(VERSION_WORDS.findall(requested))
     observed_types = set(VERSION_WORDS.findall(explicit))
@@ -243,6 +240,17 @@ EDITION_FIELDS = (
 
 
 def edition_match(field: str, wanted, observed) -> bool | None:
+    if field == "album_artists":
+        if not observed:
+            return None
+        if isinstance(wanted, str):
+            return text_key(wanted) == text_key(display_credit(observed, "joinphrase"))
+        wanted_names = [
+            text_key(credit if isinstance(credit, str) else credit["name"])
+            for credit in wanted
+        ]
+        return wanted_names == [text_key(credit["name"]) for credit in observed]
+
     values = [
         value
         for value in (observed if isinstance(observed, list) else [observed])

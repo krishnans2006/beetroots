@@ -424,15 +424,12 @@ class MatchRun:
         ]
 
     def edition_values(self) -> dict:
-        values = {
+        return {
             key: self.evidence[key]
             for key in EDITION_FIELDS
             if self.evidence.get(key)
             or (key == "track_number" and self.evidence.get(key) == 0)
         }
-        if "album_artists" in values:
-            values["album_artists"] = display_credit(values["album_artists"])
-        return values
 
     def filter_editions(
         self, options: dict[str, list[Appearance]], values: dict

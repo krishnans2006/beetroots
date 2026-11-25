@@ -120,7 +120,7 @@ RECORDING_CORE = "artists+artist-credits+aliases+isrcs+work-rels"
 RELEASE_CORE = "recordings+artist-credits+release-groups+labels+discids"
 ENTITY_INCLUDES = {
     "recording": f"{RECORDING_CORE}+releases+release-groups+ratings+work-level-rels",
-    "release": f"{RELEASE_CORE}+ratings",
+    "release": RELEASE_CORE,
     "release-group": "artist-credits+ratings",
     "artist": "ratings",
     "work": "ratings",
