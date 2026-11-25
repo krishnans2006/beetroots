@@ -43,6 +43,7 @@ beetroots match --config matcher.json --cache lookups.sqlite3 --refresh < listen
 - Use `recording_mbid` for a recording ID and `release_track_mbid` for the ID of a particular appearance. A verified ID gives the result a confidence of `1.0`. If the verified IDs point to different recordings, the result reports `conflicting_ids`. A conflicting release is reported in `issues` alongside the verified recording.
 - Supply ordered `artist_credits` as objects with `name`, optional `join_phrase`, and optional `artist_mbid`. The `artist` field takes a display string. Use `duration_ms` for the full track length and `elapsed_ms` for playback progress.
 - Spotify track IDs, URIs, and URLs use client credentials from `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` or the equivalent `MatcherConfig` fields. YouTube enrichment uses unauthenticated YouTube Music by default.
+- For a YouTube upload, pass its display label as `video_title` and its channel name as `uploader`. Use `title` and `artist` for independently known song metadata. This lets Beetroots distinguish official catalog credits and corroborated video links from uploader names.
 - Results include the input and provider evidence in `provenance`. The `metadata` field holds the canonical recording, linked MusicBrainz payloads, and verified release-track appearances. The `edition` field identifies the appearance used for `proposed_tags` and whether it was inferred. The caller can save the result and decide when to apply the proposed tags.
 - A scored match has `confidence = 1 - distance`, including zero-confidence matches. An unverified, unscorable input has null confidence and null proposed tags. Lookup failures appear in `issues`. When a failure leaves some canonical metadata unavailable, `metadata.complete` is false.
 
@@ -88,3 +89,36 @@ Use `--start-row` and `--limit` to select a one-based range of source rows. In s
 The five exports were run through the wrapper against a local replay of the [November 17, 2026 canonical MusicBrainz snapshot](https://metabrainz.org/datasets/derived-dumps). Read-only indexed MusicBrainz searches and a second pass over disputed results supplied additional evidence. The replay validates the wrapper and Beetroots against a fixed catalog. Live search ordering and full release metadata can vary.
 
 The old cutoff of 0.68 let an exact artist credit carry a different song title above the threshold. It also discarded valid ensemble credits that Spotify shortened to one artist. The importer now checks the title and credit separately before applying an MBID. The matcher also searches the credited artist individually when its ordinary search returns no same-song result. With the agreement check in place, raising the numeric cutoff dropped verified songs without removing any additional observed wrong-song tags in the replay.
+
+## Import custom YouTube Music history
+
+Run the importer from the repository root. It reads the top-level `events` array
+from a custom My Activity export and prints one ListenBrainz import request per
+line by default.
+
+```sh
+python -m roots.youtube-custom data/youtube-custom.json --limit 10 > listens.jsonl
+```
+
+Set `LISTENBRAINZ_TOKEN` to your ListenBrainz token or Koito API key to submit
+directly. [Koito scrobbler setup](https://koito.io/guides/scrobbler/)
+
+```sh
+python -m roots.youtube-custom data/youtube-custom.json \
+  --submit http://127.0.0.1:4110/apis/listenbrainz/1
+```
+
+The importer uses the event timestamp and keeps repeated plays. It sends the
+video URL, full duration, available device labels and reported progress. A
+progress percentage is carried as context because the export gives no elapsed
+playback time. Events with usable display metadata can be imported without an
+MBID. The importer reports malformed events and events missing an artist or
+title on stderr.
+
+Beetroots uses exact MusicBrainz streaming links when they identify a single
+recording. Otherwise it checks the available title, credit, version and duration
+evidence and uses beets for candidate search and ranking. Use
+`--min-confidence` to raise the default confidence floor of 0.0. Use
+`--start-row`, `--limit` and `--batch-size` to control the import range and
+batches. `--config` and `--cache` work as they do for Spotify. A full import with
+a cold cache can take hours because MusicBrainz requests are rate limited.

@@ -59,7 +59,9 @@ def listen(track: TrackInput, tags: dict, context: dict) -> dict | None:
     number = tags.get("track_number_text") or tags.get("track_number")
     if number is not None:
         info["tracknumber"] = str(number)
-    duration = tags.get("duration_ms")
+    duration = track.get("duration_ms")
+    if type(duration) is not int or not 0 < duration <= MAX_DURATION_MS:
+        duration = tags.get("duration_ms")
     if type(duration) is int and 0 < duration <= MAX_DURATION_MS:
         info["duration_ms"] = duration
     if genres := [g for g in tags.get("genres", ()) if 0 < len(g) <= 64]:
