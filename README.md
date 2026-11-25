@@ -4,4 +4,4 @@
 
 A multi-tool that adapts Beets for tagging in a variety of situations.
 
-It's goal is simple: use the available information as best as possible to identify authoritative sources (e.g., MusicBrainz IDs), evaluate confidence, and return the corrected tags.
+It's goal is simple: use the available information as best as possible to identify authoritative sources (e.g., MusicBrainz IDs), evaluate confidence, and return the corrected tags. It generalizes beets away from just music files and into a more general tagging tool for things like scrobbles and exported listening history.
