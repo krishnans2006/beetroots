@@ -465,6 +465,139 @@ class MatchTests(unittest.TestCase):
             "2001",
         )
 
+    def test_video_display_evidence_requires_recording_agreement(self):
+        watch = self.responses[f"watch:{YOUTUBE}"]["tracks"][1]
+        watch.update(
+            title="Signal",
+            artists=[{"name": "The Act"}, {"name": "Guest"}],
+            album=None,
+            videoType="MUSIC_VIDEO_TYPE_OMV",
+        )
+        self.responses[f"/ws/2/url?https://www.youtube.com/watch?v={DELETED}"] = {
+            "relations": [
+                {"type": "free streaming", "recording": {"id": LIVE}},
+                {"type": "free streaming", "recording": {"id": STUDIO}, "ended": True},
+            ]
+        }
+        self.save_responses()
+        official = {
+            "video_title": "The Act - Signal (Official Lyric Video)",
+            "uploader": "TheActVEVO",
+            "youtube_video_id": YOUTUBE,
+            "duration_ms": 244000,
+        }
+        uncredited = {
+            "video_title": "The Act - Signal (Fan Edit)",
+            "uploader": "Fan Uploads",
+            "duration_ms": 244000,
+        }
+        with self.matcher() as matcher:
+            match = matcher.match(official)
+            self.assertEqual(
+                match.tags_for(official, min_confidence=0, require_song_agreement=True)[
+                    "recording_mbid"
+                ],
+                STUDIO,
+            )
+            mismatch = matcher.match({**official, "duration_ms": 325000})
+            self.assertIsNone(mismatch.recording_mbid)
+            fallback = matcher.match(uncredited)
+            self.assertIsNone(fallback.recording_mbid)
+            self.assertEqual(
+                fallback.tags_for(uncredited, min_confidence=0),
+                {"artist": "Fan Uploads", "title": uncredited["video_title"]},
+            )
+            linked = matcher.match(
+                {
+                    **uncredited,
+                    "video_title": "Concert footage from the Arena",
+                    "youtube_video_id": DELETED,
+                }
+            )
+            self.assertEqual(linked.recording_mbid, LIVE)
+            self.assertEqual(linked.provenance["youtube_recording_link"], LIVE)
+
+    def test_video_uses_verified_track_title_for_the_version(self):
+        watch = self.responses[f"watch:{YOUTUBE}"]["tracks"][1]
+        watch.update(
+            title="Signal (Radio Edit)",
+            album={"name": "Signal Album", "id": "fixture-album"},
+            videoType="MUSIC_VIDEO_TYPE_ATV",
+        )
+        release = self.responses[f"/ws/2/release/{EARLY}"]
+        release["media"][0]["tracks"][0]["title"] = (
+            "Signal (Radio Edit) (Album Version)"
+        )
+        self.save_responses()
+        with self.matcher() as matcher:
+            result = matcher.match(
+                {
+                    "video_title": "Signal (Radio Edit)",
+                    "youtube_video_id": YOUTUBE,
+                    "duration_ms": 244000,
+                }
+            )
+        self.assertEqual(result.recording_mbid, STUDIO)
+        self.assertEqual(result.edition["release_track_mbid"], FIRST)
+
+    def test_custom_youtube_import_uses_history_events(self):
+        history = self.path / "history.json"
+        event = {
+            "timestampMicroseconds": "1700000000123456",
+            "videoId": YOUTUBE,
+            "title": "Album Song",
+            "app": "YouTube Music",
+            "channels": [{"name": "Release - Topic"}],
+            "devices": ["Web"],
+            "durationLabel": "4:04",
+            "videoProgressPercent": 10,
+        }
+        history.write_text(
+            json.dumps(
+                {
+                    "run": {"validation": {"events": [event]}},
+                    "events": [
+                        event,
+                        "malformed",
+                        event,
+                        {**event, "timestampMicroseconds": "1700000300123456"},
+                    ],
+                }
+            )
+        )
+        config = self.path / "config.json"
+        config.write_text(json.dumps(asdict(self.config)))
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "roots.youtube-custom",
+                str(history),
+                "--config",
+                str(config),
+                "--start-row",
+                "2",
+                "--batch-size",
+                "1",
+            ],
+            capture_output=True,
+            check=True,
+        )
+        requests = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(all(r["listen_type"] == "import" for r in requests))
+        payloads = [r["payload"][0] for r in requests]
+        self.assertEqual([p["listened_at"] for p in payloads], [1700000000, 1700000300])
+        metadata = payloads[0]["track_metadata"]
+        self.assertEqual(metadata["artist_name"], "The Act")
+        self.assertEqual(metadata["track_name"], "Album Song")
+        info = metadata["additional_info"]
+        self.assertEqual(info["recording_mbid"], ALBUM_REC)
+        self.assertEqual(info["duration_ms"], 244000)
+        self.assertEqual(info["youtube_progress_percent"], 10)
+        self.assertNotIn("duration_played_ms", info)
+        self.assertIn(b"Row 2: expected a history object", result.stderr)
+
     def test_scores_and_version_edition_constraints(self):
         (
             exact,

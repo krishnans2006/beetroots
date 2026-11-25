@@ -41,6 +41,8 @@ class TrackInput(TypedDict, total=False):
     spotify_track_id: str
     spotify_uri: str
     youtube_video_id: str
+    video_title: str
+    uploader: str
     source_urls: list[str]
     duration_ms: int
     disc_number: int
@@ -102,10 +104,16 @@ class MatchResult:
         tags = {
             key: track[key] for key in ("title", "artist", "album") if track.get(key)
         }
+        tags.update(self.provenance.get("source_tags", {}))
         proposal = self.proposed_tags
         if not proposal or self.confidence is None or self.confidence < min_confidence:
             return tags
-        if require_song_agreement and self.method == "metadata":
+        # Video scoring already checks the normalized recording evidence.
+        corroborated = (
+            self.recording_mbid
+            and self.provenance.get("corroborated_recording") == self.recording_mbid
+        )
+        if require_song_agreement and self.method == "metadata" and not corroborated:
             metadata = self.metadata or {}
             recording = metadata.get("recording") or {}
             titles = [proposal.get("title"), proposal.get("release_track_title")]

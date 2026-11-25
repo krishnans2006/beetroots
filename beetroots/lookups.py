@@ -172,13 +172,24 @@ class MusicBrainz(MusicBrainzAPI):
         return self.raw(f"recording/{mbid}", inc=RECORDING_CORE)
 
     def recordings_by_credit(
-        self, artist: str, title: str, *, limit: int
+        self,
+        artist: str,
+        title: str,
+        *,
+        limit: int,
+        duration: tuple[int, int] | None = None,
+        video: bool | None = None,
     ) -> list[dict]:
         def phrase(value: str) -> str:
             return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
         credit = phrase(artist)
         query = f"recording:{phrase(title)} AND (artistname:{credit} OR creditname:{credit})"
+        if duration:
+            lower, upper = duration
+            query += f" AND dur:[{lower} TO {upper}]"
+        if video is not None:
+            query += f" AND video:{str(video).lower()}"
         result = self.raw("recording", query=query, limit=limit)
         if result is None:
             raise HTTPNotFoundError()

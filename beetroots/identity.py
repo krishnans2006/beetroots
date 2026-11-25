@@ -17,6 +17,7 @@ _VERSION = re.compile(
     re.IGNORECASE,
 )
 _CREDIT = re.compile(r"\b(?:feat\.?|ft\.?|featuring|with|from)\s+", re.IGNORECASE)
+_FEATURE_SUFFIX = re.compile(r"\s+(?:feat\.|ft\.|featuring)\s+.+$", re.IGNORECASE)
 # Modifier-letter apostrophes are alphanumeric in Unicode. They serve the
 # same purpose as straight and curly apostrophes in many catalog credits.
 _APOSTROPHES = str.maketrans("", "", "ʻʼʹꞌ")
@@ -41,7 +42,7 @@ def base_title(title: str) -> str:
         if not (_CREDIT.match(qualifier) or _VERSION.search(qualifier)):
             break
         title = _TRAILING_DASH.sub("", title[: match.start()].rstrip())
-    return title
+    return _FEATURE_SUFFIX.sub("", title)
 
 
 def title_keys(title: str, artists: Iterable[str] = ()) -> set[str]:

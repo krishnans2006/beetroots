@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 from beets.autotag import Source
+from beets.autotag.distance import get_track_length_grace
 from beets.autotag.hooks import TrackInfo
 from beets.library import Item
 from beetsplug.musicbrainz import MusicBrainzPlugin
@@ -32,6 +33,7 @@ from .identity import agrees, appearance_names, base_title, names_from_credits
 from .lookups import LookupFailure
 from .metadata import artist_ids, collect_metadata, proposed_tags
 from .schema import MatchIssue, MatchResult, TrackInput
+from .video import VideoEvidence, compatible_version, length_difference
 
 
 @dataclass
@@ -67,6 +69,8 @@ class MatchRun:
         self.browse_releases: dict[str, dict] = {}
         self.spotify_recordings: set[str] = set()
         self.isrc_recordings: set[str] = set()
+        self.video_recordings: set[str] = set()
+        self.video: VideoEvidence | None = None
 
     def issue(self, path: str, code: str, detail: str) -> None:
         issue = MatchIssue(path=path, code=code, detail=detail)
@@ -285,6 +289,7 @@ class MatchRun:
                 spotify_ids.append(spotify)
             if youtube:
                 youtube_ids.append(youtube)
+        video_input = "video_title" in self.evidence
         isrcs = list(self.evidence.get("isrcs", []))
         providers = self.engine.providers
         for provider, ids, pattern, fetch, enabled in (
@@ -355,6 +360,9 @@ class MatchRun:
                     "response": raw,
                 }
                 fields = metadata[identifier]["fields"]
+                if video_input and provider == "youtube_music":
+                    isrcs.extend(fields.get("isrcs", []))
+                    continue
                 for key, value in fields.items():
                     if key == "isrcs":
                         isrcs.extend(value)
@@ -364,6 +372,12 @@ class MatchRun:
                         self.evidence[key] = value
             if metadata:
                 self.provenance["providers"][provider] = metadata
+        if video_input:
+            metadata = self.provenance["providers"].get("youtube_music", {})
+            tags = self.provenance["source_tags"] = {}
+            self.video = VideoEvidence.apply(
+                self.evidence, next(iter(metadata.values()), {}), tags
+            )
         self.evidence["source_urls"] = list(
             dict.fromkeys(
                 url for url in urls if url.startswith(("https://", "http://"))
@@ -447,7 +461,15 @@ class MatchRun:
         for key, value in values.items():
             compared = {
                 mbid: [
-                    (appearance, edition_match(key, value, appearance.fields()[key]))
+                    (
+                        appearance,
+                        edition_match(
+                            key,
+                            value,
+                            appearance.fields()[key],
+                            normalize_album_ampersand=self.video is not None,
+                        ),
+                    )
                     for appearance in choices
                 ]
                 for mbid, choices in options.items()
@@ -516,6 +538,14 @@ class MatchRun:
                         and MBID.fullmatch(recording.get("id", ""))
                     ):
                         self.spotify_recordings.add(recording["id"])
+                    if (
+                        self.video
+                        and relation.get("type") in {"free streaming", "streaming"}
+                        and not relation.get("ended")
+                        and MBID.fullmatch(recording.get("id", ""))
+                        and provider_ids(url)[1]
+                    ):
+                        self.video_recordings.add(recording["id"])
                 elif release := relation.get("release"):
                     if payload := self.lookup(
                         path, self.mb.release_core, release["id"]
@@ -636,7 +666,8 @@ class MatchRun:
                 if identifier and MBID.fullmatch(identifier):
                     text_hits.setdefault(identifier, []).append((path, hit))
 
-        for title in titles or [""]:
+        search_titles = [] if self.video and not self.video.artist else titles or [""]
+        for title in search_titles:
             if not title and not source.artist:
                 continue
             results = self.lookup(
@@ -651,13 +682,14 @@ class MatchRun:
             add_hits(results or [], "text")
         # A Spotify artist can be a single performer from a longer MusicBrainz
         # credit. The ordinary combined-credit search can miss that recording.
+        artist = self.video.artist if self.video else source.artist
         if (
-            source.artist
+            artist
             and titles
             and not any(
                 agrees(
                     titles,
-                    source.artist,
+                    artist,
                     [hit.get("title")],
                     [
                         display_credit(hit.get("artist-credit"), "joinphrase"),
@@ -672,12 +704,38 @@ class MatchRun:
             results = self.lookup(
                 path,
                 self.mb.recordings_by_credit,
-                source.artist,
+                artist,
                 base_title(titles[0]),
                 limit=self.engine.settings.search_limit,
             )
             add_hits(results or [], path)
-        supplemental_hits = self.supplemental(titles)
+        return self.resolve_candidates(text_hits, self.supplemental(titles))
+
+    def duration_candidates(
+        self, artist: str, title: str, length: float, *, video: bool | None = None
+    ) -> list[Candidate]:
+        path = "text.duration"
+        grace = get_track_length_grace()
+        bounds = (max(0, int((length - grace) * 1000)), int((length + grace) * 1000))
+        results = self.lookup(
+            path,
+            self.mb.recordings_by_credit,
+            artist,
+            base_title(title),
+            limit=self.engine.settings.search_limit,
+            duration=bounds,
+            video=video,
+        )
+        return self.resolve_candidates(
+            {
+                mbid: [(path, hit)]
+                for hit in results or []
+                if (mbid := hit.get("id")) and MBID.fullmatch(mbid)
+            },
+            {},
+        )
+
+    def resolve_candidates(self, text_hits, supplemental_hits) -> list[Candidate]:
         candidates: dict[str, Candidate] = {}
         text_order = []
         for identifier in dict.fromkeys([*text_hits, *sorted(supplemental_hits)]):
@@ -783,6 +841,7 @@ class MatchRun:
 
         linked = None
         for link_kind, identifiers in (
+            ("youtube_recording_link", self.video_recordings),
             ("spotify_recording_link", self.spotify_recordings),
             ("isrc_recording_link", self.isrc_recordings),
         ):
@@ -794,7 +853,10 @@ class MatchRun:
                     candidate
                     for candidate in candidates
                     if candidate.info.track_id in linked_ids
-                    and agrees(titles, "", recording_titles(candidate), [])
+                    and (
+                        link_kind == "youtube_recording_link"
+                        or agrees(titles, "", recording_titles(candidate), [])
+                    )
                 ),
                 None,
             )
@@ -802,19 +864,25 @@ class MatchRun:
                 candidates = [linked]
                 break
 
-        # Keep release-search hits long enough to check their actual track
-        # titles and credits when Spotify supplied an album artist.
+        # Keep release-search hits long enough to check track titles and credits.
         spotify = self.evidence.get("source") == "spotify"
+        source_artists = self.video.artists if self.video else (item.artist,)
+
+        def song_agreement(known_titles, known_names):
+            if not self.video:
+                return agrees(titles, item.artist, known_titles, known_names)
+            return bool(titles) and any(
+                artist and agrees(titles, artist, known_titles, known_names)
+                for artist in source_artists
+            )
+
         same_song = set()
-        if titles and item.artist:
+        if titles and any(source_artists):
             same_song = {
                 candidate.info.track_id
                 for candidate in candidates
-                if agrees(
-                    titles,
-                    item.artist,
-                    recording_titles(candidate),
-                    recording_names(candidate),
+                if song_agreement(
+                    recording_titles(candidate), recording_names(candidate)
                 )
             }
             if same_song:
@@ -822,12 +890,12 @@ class MatchRun:
                     candidate
                     for candidate in candidates
                     if candidate.info.track_id in same_song
-                    or (spotify and "edition.search" in candidate.paths)
+                    or ((spotify or self.video) and "edition.search" in candidate.paths)
                 ]
 
         # Compare versions only after establishing which candidates share
         # the song. A live version of another song is still another song.
-        for qualifier in ("version", "disambiguation"):
+        for qualifier in () if self.video else ("version", "disambiguation"):
             if requested := self.evidence.get(qualifier):
                 states = [
                     version_match(
@@ -859,7 +927,7 @@ class MatchRun:
             )
         compatible = set(same_song)
         agreeing_tracks = set()
-        if spotify and item.album:
+        if (spotify or self.video) and item.album:
             for candidate in candidates:
                 mbid = candidate.info.track_id
                 names = recording_names(candidate)
@@ -867,10 +935,13 @@ class MatchRun:
                 matches_album = [
                     a.track_id
                     for a in options[mbid]
-                    if edition_match("album", item.album, a.release.get("title"))
-                    and agrees(
-                        titles,
-                        item.artist,
+                    if edition_match(
+                        "album",
+                        item.album,
+                        a.release.get("title"),
+                        normalize_album_ampersand=self.video is not None,
+                    )
+                    and song_agreement(
                         [*known_titles, a.track.get("title")],
                         [*names, *appearance_names(a.track, a.release)],
                     )
@@ -878,12 +949,14 @@ class MatchRun:
                 if matches_album:
                     compatible.add(mbid)
                     agreeing_tracks.update(matches_album)
-            if compatible.intersection(options):
+            if compatible.intersection(options) and not linked and not self.video:
                 options = {
                     mbid: choices
                     for mbid, choices in options.items()
                     if mbid in compatible
                 }
+        if self.video and not linked:
+            options = self.video_options(candidates, options, compatible, item, titles)
         options, identified = self.filter_editions(options, values)
         matches = []
         wanted_versions = recording_versions(titles[0]) if spotify and titles else set()
@@ -903,7 +976,12 @@ class MatchRun:
                 if spotify
                 else set()
             )
-            video = spotify and bool(candidate.recording.get("video"))
+            video = bool(candidate.recording.get("video"))
+            wrong_medium = (
+                self.video.preferred_video not in (None, video)
+                if self.video
+                else spotify and video
+            )
             choices = options[mbid]
             # Prefer positively identified editions when otherwise tied.
             choices = sorted(
@@ -922,6 +1000,30 @@ class MatchRun:
                 song_agrees = mbid in same_song or (
                     selected is not None and selected.track_id in agreeing_tracks
                 )
+                difference = None
+                missing_duration = False
+                unmatched_album = False
+                if self.video and candidate is not linked:
+                    difference = length_difference(
+                        item.length,
+                        candidate.info.length,
+                        (selected.track.get("length") or 0) / 1000
+                        if selected
+                        else None,
+                    )
+                    missing_duration = bool(item.length and difference is None)
+                    unmatched_album = bool(
+                        item.album
+                        and (
+                            not selected
+                            or not edition_match(
+                                "album",
+                                item.album,
+                                selected.release.get("title"),
+                                normalize_album_ampersand=True,
+                            )
+                        )
+                    )
                 versions = observed_versions
                 if spotify and selected:
                     versions = versions | recording_versions(
@@ -949,7 +1051,15 @@ class MatchRun:
                 if distance is not None:
                     matches.append(
                         (
-                            (not song_agrees, video, variant, distance),
+                            (
+                                not song_agrees,
+                                wrong_medium,
+                                variant,
+                                unmatched_album,
+                                missing_duration,
+                                distance,
+                                difference or 0,
+                            ),
                             candidate,
                             selected,
                         )
@@ -957,11 +1067,78 @@ class MatchRun:
         if not matches:
             return None
         # With comparable identity evidence, preserve beets' ranking.
-        (_, _, _, distance), winner, selected = min(matches, key=lambda match: match[0])
+        (_, _, _, _, _, distance, _), winner, selected = min(
+            matches, key=lambda match: match[0]
+        )
         self.provenance["candidate_paths"] = sorted(winner.paths)
         if winner is linked:
             self.provenance[link_kind] = winner.info.track_id
         return winner.info.track_id, float(distance), selected
+
+    def video_options(
+        self,
+        candidates: list[Candidate],
+        options: dict[str, list[Appearance]],
+        compatible: set[str],
+        item: Item,
+        titles: list[str],
+    ) -> dict[str, list[Appearance]]:
+        """Filter recording and tracklist evidence before choosing an edition."""
+        if not titles:
+            return {}
+        eligible = {}
+        grace = get_track_length_grace()
+        version = self.evidence.get("version") or self.evidence.get("disambiguation")
+        for candidate in candidates:
+            mbid = candidate.info.track_id
+            if mbid not in compatible:
+                continue
+            releases = [a.release for a in options[mbid]] or (
+                candidate.recording.get("releases") or []
+            )
+            only_live = bool(releases) and all(
+                "Live"
+                in ((release.get("release-group") or {}).get("secondary-types") or [])
+                for release in releases
+            )
+            disambiguation = candidate.info.trackdisambig or ""
+            valid_appearances = []
+            for appearance in [*options[mbid], None]:
+                edition = (
+                    appearance
+                    if appearance
+                    and edition_match(
+                        "album",
+                        item.album,
+                        appearance.release.get("title"),
+                        normalize_album_ampersand=True,
+                    )
+                    else None
+                )
+                difference = length_difference(
+                    item.length,
+                    candidate.info.length,
+                    (edition.track.get("length") or 0) / 1000 if edition else None,
+                )
+                if not compatible_version(
+                    titles[0],
+                    version,
+                    candidate.info.title or "",
+                    f"{disambiguation} live"
+                    if only_live and not edition
+                    else disambiguation,
+                    (edition.track.get("title") or "") if edition else "",
+                ):
+                    continue
+                if difference is None:
+                    if item.length and not edition:
+                        continue
+                elif difference > grace:
+                    continue
+                eligible[mbid] = valid_appearances
+                if appearance:
+                    valid_appearances.append(appearance)
+        return eligible
 
     def finish(
         self, mbid: str, method, distance: float | None, selected: Appearance | None
@@ -975,6 +1152,8 @@ class MatchRun:
         if not (recording := self.entity("recording", mbid)):
             return self.result("lookup_error", **identity)
         identity["recording_mbid"] = recording["id"]
+        if self.video and method == "metadata":
+            self.provenance["corroborated_recording"] = recording["id"]
         self.aliases[mbid] = recording["id"]
         collected = self.lookup("metadata", collect_metadata, self, recording, selected)
         if collected is None:
@@ -1082,6 +1261,43 @@ class MatchRun:
             )
         )
         candidates = self.find_candidates(Source.from_item(item), search_titles)
+        selected = self.score(candidates, item, titles) if candidates else None
+        if self.video and self.video.artist and titles and item.length:
+            check_album = find_video = False
+            if selected and not self.provenance.get("youtube_recording_link"):
+                recording_id, _, occurrence = selected
+                check_album = bool(
+                    item.album
+                    and not (
+                        occurrence
+                        and edition_match(
+                            "album",
+                            item.album,
+                            occurrence.release.get("title"),
+                            normalize_album_ampersand=True,
+                        )
+                    )
+                )
+                find_video = self.video.preferred_video is True and not any(
+                    c.info.track_id == recording_id and c.recording.get("video")
+                    for c in candidates
+                )
+            if selected is None or find_video or check_album:
+                more = self.duration_candidates(
+                    self.video.artist,
+                    titles[0],
+                    item.length,
+                    video=True if find_video else None,
+                )
+                seen = {candidate.info.track_id for candidate in candidates}
+                new = [
+                    candidate
+                    for candidate in more
+                    if candidate.info.track_id not in seen
+                ]
+                if new:
+                    candidates.extend(new)
+                    selected = self.score(candidates, item, titles)
         if not candidates:
             if any(issue["code"] == "lookup_error" for issue in self.issues):
                 return self.result("lookup_error")
@@ -1091,7 +1307,6 @@ class MatchRun:
             ):
                 return self.result("unresolved_id")
             return self.result("no_candidates")
-        selected = self.score(candidates, item, titles)
         if selected is None:
             return self.result("insufficient_evidence")
         mbid, distance, occurrence = selected

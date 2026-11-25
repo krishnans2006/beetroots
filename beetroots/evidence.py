@@ -207,18 +207,23 @@ def title_qualifiers(title: str) -> str:
     )
 
 
-def recording_versions(title: str, disambiguation: str = "") -> set[str]:
+def recording_versions(
+    title: str, disambiguation: str = "", *, distinguish_studio_mix: bool = False
+) -> set[str]:
     """Read explicit audio variations. Mastering labels describe the edition."""
-    text = text_key(f"{title_qualifiers(title)} {disambiguation}")
+    parts = [text_key(title_qualifiers(title)), text_key(disambiguation)]
+    text = " ".join(parts)
     versions = {
         kind
         for kind, expression in _RECORDING_VERSIONS.items()
         if re.search(expression, text)
     }
-    if (
-        not versions
-        and re.search(r"\bmix\b", text)
-        and not re.search(r"\b(?:original|mono|stereo)\b", text)
+    if distinguish_studio_mix and re.search(r"\bstudio mix\b", text):
+        versions.add("mix")
+    if not versions and any(
+        re.search(r"\bmix\b", part)
+        and not re.search(r"\b(?:original|mono|stereo)\b", part)
+        for part in parts
     ):
         versions.add("mix")
     return versions
@@ -269,7 +274,9 @@ EDITION_FIELDS = (
 )
 
 
-def edition_match(field: str, wanted, observed) -> bool | None:
+def edition_match(
+    field: str, wanted, observed, *, normalize_album_ampersand: bool = False
+) -> bool | None:
     if field == "album_artists":
         if not observed:
             return None
@@ -289,6 +296,12 @@ def edition_match(field: str, wanted, observed) -> bool | None:
     if not values:
         return None
     if isinstance(wanted, str):
+        if field == "album" and normalize_album_ampersand:
+            return any(
+                text_key(wanted.replace("&", " and "))
+                == text_key(value.replace("&", " and "))
+                for value in values
+            )
         if field == "release_date":
             wanted_parts = wanted.split("-")
             unknown = False
