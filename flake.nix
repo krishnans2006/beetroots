@@ -61,9 +61,11 @@
             packages = [
               python.pkgs.venvShellHook
               python.pkgs.pip
+              python.pkgs.setuptools
 
               python.pkgs.beets
               python.pkgs.mutagen
+              python.pkgs.ytmusicapi
             ];
           };
         }

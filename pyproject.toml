@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beetroots"
+version = "0.1.0"
+description = "Identify listens and propose MusicBrainz tags with beets"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = ["beets==2.14.1", "requests>=2", "ytmusicapi>=1.12,<2"]
+
+[project.scripts]
+beetroots = "beetroots.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["beetroots*"]
