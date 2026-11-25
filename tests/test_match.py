@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from beetroots import Matcher, MatcherConfig
 from beetroots.identity import agrees
+from roots import listenbrainz, spotify
 
 
 def mbid(number):
@@ -585,6 +586,88 @@ class MatchTests(unittest.TestCase):
     def test_modifier_letter_apostrophe_in_credit(self):
         title = "Fixture Recording Alpha"
         self.assertTrue(agrees([title], "Fixture'A", [title], ["FixtureʻA"]))
+        self.assertTrue(
+            agrees(["Fixture ™ Theme"], "Act", ["Fixture (TM) Theme"], ["Act"])
+        )
+
+    def test_spotify_uses_source_release_credits_and_preserves_other_album_names(self):
+        edition = self.responses[f"/ws/2/release/{ALBUM_RELEASE}"]
+        appearance = edition["media"][0]["tracks"][0]
+        appearance["artist-credit"] = [artist("Fixture Composer", OTHER)]
+        self.responses[
+            "/ws/2/recording?recording:(album song) release:(provider album)"
+        ] = {"recordings": [{"id": ALBUM_REC}]}
+        self.save_responses()
+        matcher = self.matcher()
+        source = {
+            "source": "spotify",
+            "title": "Album Song",
+            "artist": "Fixture Composer",
+            "album": "Provider Album",
+            "listened_at": 1704067200,
+        }
+        good = spotify.import_tags(source, matcher.match(source), 0)
+        info = listenbrainz.listen(source, good, {})["track_metadata"][
+            "additional_info"
+        ]
+        self.assertEqual(info["recording_mbid"], ALBUM_REC)
+        self.assertEqual(info["track_mbid"], ALBUM_TRACK)
+
+        different_album = {**source, "artist": "The Act", "album": "Source Reissue"}
+        tags = spotify.import_tags(different_album, matcher.match(different_album), 0)
+        metadata = listenbrainz.listen(different_album, tags, {})["track_metadata"]
+        self.assertEqual(metadata["release_name"], "Source Reissue")
+        self.assertEqual(metadata["additional_info"]["recording_mbid"], ALBUM_REC)
+        self.assertNotIn("release_mbid", metadata["additional_info"])
+        self.assertNotIn("track_mbid", metadata["additional_info"])
+
+        wrong_title = {**source, "title": "Different Song"}
+        self.assertNotIn(
+            "recording_mbid",
+            spotify.import_tags(wrong_title, matcher.match(wrong_title), 0),
+        )
+
+    def test_spotify_prefers_audio_and_matching_edits_with_the_same_title(self):
+        alternate = recording(LIVE, "Signal", disambiguation="album version")
+        intended = recording(STUDIO, "Signal", disambiguation="single version")
+        remix = recording(ACOUSTIC, "Signal", disambiguation="club mix")
+        video = {
+            **recording(EXACT, "Signal", disambiguation="single version"),
+            "video": True,
+        }
+        for candidate in (alternate, intended, remix, video):
+            self.responses[f"/ws/2/recording/{candidate['id']}"] = candidate
+        self.responses[
+            "/ws/2/recording?artist:(the act) recording:(signal) alias:(signal)"
+        ] = {"recordings": [remix, alternate, video, intended]}
+        self.save_responses()
+        matcher = self.matcher()
+        source = {
+            "source": "spotify",
+            "artist": "The Act",
+            "title": "Signal - Single Version",
+        }
+        self.assertEqual(
+            spotify.import_tags(source, matcher.match(source), 0)["recording_mbid"],
+            STUDIO,
+        )
+        plain = {**source, "title": "Signal"}
+        self.assertEqual(
+            spotify.import_tags(plain, matcher.match(plain), 0)["recording_mbid"], LIVE
+        )
+
+    def test_unique_title_corroborated_isrc_prioritizes_recording(self):
+        self.responses[f"/ws/2/isrc/{ISRC}"] = {
+            "recordings": [{"id": EXACT}],
+        }
+        self.save_responses()
+        matcher = self.matcher()
+        source = {"title": "Signal", "artist": "The Act", "isrcs": [ISRC]}
+        result = matcher.match(source)
+        self.assertEqual(result.recording_mbid, EXACT)
+        self.assertEqual(result.provenance["isrc_recording_link"], EXACT)
+        wrong = matcher.match({**source, "title": "Different Song"})
+        self.assertNotIn("isrc_recording_link", wrong.provenance)
 
     def test_secondary_catalog_numbers_preserve_work_and_movement_identity(self):
         artist = "Fixture Performer"
@@ -810,6 +893,22 @@ class MatchTests(unittest.TestCase):
                 "isrc:GBABC0123456",
                 f"candidate.recording:{LIVE}",
             },
+        )
+
+    def test_indexed_credit_without_join_phrase_survives_lookup_failure(self):
+        hit = recording(STUDIO, "Signal")
+        hit["artist-credit"] = [dict(credit) for credit in hit["artist-credit"]]
+        hit["artist-credit"][-1].pop("joinphrase")
+        self.responses[
+            "/ws/2/recording?artist:(the act) recording:(signal) alias:(signal)"
+        ] = {"recordings": [hit]}
+        self.responses[f"/ws/2/recording/{STUDIO}"] = 503
+        self.save_responses()
+        result = self.matcher().match({"artist": "The Act", "title": "Signal"})
+        self.assertEqual(result.recording_mbid, STUDIO)
+        self.assertEqual(result.status, "matched")
+        self.assertFalse(
+            any(i["path"].startswith("candidate.extract") for i in result.issues)
         )
 
 

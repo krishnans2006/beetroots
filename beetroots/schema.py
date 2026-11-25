@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Literal, NotRequired, TypedDict
 
 from .identity import agrees, names_from_credits
+from .identity import key as identity_key
 
 VERSION = "0.1.0"
 BEETS_VERSION = "2.14.1"
@@ -115,14 +116,25 @@ class MatchResult:
                 proposal.get("artist"),
                 *names_from_credits(proposal.get("artist_credits", [])),
             ]
+            if (
+                track.get("source") == "spotify"
+                and track.get("album")
+                and identity_key(track["album"])
+                == identity_key(proposal.get("album", ""))
+                and self.edition
+                and not self.edition["inferred"]
+            ):
+                for field in ("release_track_artist_credits", "album_artists"):
+                    artists.extend(names_from_credits(proposal.get(field, [])))
             for artist in metadata.get("entities", {}).get("artist", {}).values():
                 if artist.get("id") in proposal.get("artist_mbids", []):
                     artists.extend(
                         alias.get("name") for alias in (artist.get("aliases") or [])
                     )
             source_titles = [track.get("title", ""), *track.get("alternate_titles", [])]
-            linked = self.recording_mbid and (
-                self.provenance.get("spotify_recording_link") == self.recording_mbid
+            linked = self.recording_mbid and any(
+                self.provenance.get(field) == self.recording_mbid
+                for field in ("spotify_recording_link", "isrc_recording_link")
             )
             if not (
                 agrees(source_titles, track.get("artist", ""), titles, artists)

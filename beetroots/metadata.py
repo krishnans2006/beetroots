@@ -195,6 +195,7 @@ def proposed_tags(run, metadata: dict, occurrence: Appearance | None) -> dict:
                 "release_group_mbid": group.get("id"),
                 "release_track_mbid": track["id"],
                 "release_track_title": track.get("title"),
+                "release_track_artist_credits": track.get("artist-credit"),
                 "album": release.get("title"),
                 "album_artist": display_credit(
                     release.get("artist-credit"), "joinphrase"

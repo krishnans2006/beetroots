@@ -183,6 +183,19 @@ VERSION_WORDS = re.compile(
     r"\b(?:live|studio|acoustic|unplugged|remix|instrumental|demo|radio edit|remaster(?:ed)?)\b"
 )
 VERSION_SUFFIX = re.compile(r"\(([^()]*)\)|\[([^\[\]]*)\]|\s[-–—]\s(.+)$")
+_RECORDING_VERSIONS = {
+    "live": r"\blive\b|\bin concert\b",
+    "acoustic": r"\b(?:acoustic|unplugged)\b",
+    "instrumental": r"\b(?:instrumental|karaoke|backing track)\b",
+    "demo": r"\bdemo\b",
+    "mix": r"\b(?:remix|rework|dub mix|surround mix|dolby atmos|5 1 mix)\b",
+    "radio edit": r"\bradio (?:edit|ver(?:sion)?|mix)\b",
+    "single edit": r"\bsingle (?:edit|ver(?:sion)?|mix)\b",
+    "album version": r"\balbum (?:edit|ver(?:sion)?|mix)\b",
+    "long version": r"\b(?:long|extended) (?:edit|ver(?:sion)?|mix)\b",
+    "short version": r"\bshort (?:edit|ver(?:sion)?|mix)\b",
+    "alternate": r"\b(?:alternate|alternative|session|sessions) (?:take|mix|version)\b",
+}
 
 
 def title_qualifiers(title: str) -> str:
@@ -192,6 +205,23 @@ def title_qualifiers(title: str) -> str:
         for value in match.groups()
         if value
     )
+
+
+def recording_versions(title: str, disambiguation: str = "") -> set[str]:
+    """Read explicit audio variations. Mastering labels describe the edition."""
+    text = text_key(f"{title_qualifiers(title)} {disambiguation}")
+    versions = {
+        kind
+        for kind, expression in _RECORDING_VERSIONS.items()
+        if re.search(expression, text)
+    }
+    if (
+        not versions
+        and re.search(r"\bmix\b", text)
+        and not re.search(r"\b(?:original|mono|stereo)\b", text)
+    ):
+        versions.add("mix")
+    return versions
 
 
 def version_evidence(title: str) -> str:

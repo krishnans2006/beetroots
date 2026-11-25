@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from beetroots import Matcher, MatcherConfig, TrackInput, __version__
+from beetroots.identity import key
 
 if __package__:
     from . import listenbrainz
@@ -95,6 +96,26 @@ def spotify_play(row: dict, number: int, include_ip: bool) -> tuple[TrackInput, 
     return track, context
 
 
+def import_tags(track: TrackInput, result, min_confidence: float) -> dict:
+    tags = result.tags_for(
+        track, min_confidence=min_confidence, require_song_agreement=True
+    )
+    if track.get("album") and key(track["album"]) != key(tags.get("album", "")):
+        tags["album"] = track["album"]
+        for field in (
+            "release_mbid",
+            "release_group_mbid",
+            "release_track_mbid",
+            "album_artist",
+            "album_artists",
+            "track_number",
+            "track_number_text",
+            "labels",
+        ):
+            tags.pop(field, None)
+    return tags
+
+
 def listens(rows, matcher, args):
     for number, row in enumerate(rows, args.start_row):
         if not isinstance(row, dict):
@@ -115,9 +136,7 @@ def listens(rows, matcher, args):
         if not any(track.get(field) for field in ("title", "artist", "spotify_uri")):
             print(f"Row {number}: missing track metadata", file=sys.stderr)
             continue
-        tags = matcher.match(track).tags_for(
-            track, min_confidence=args.min_confidence, require_song_agreement=True
-        )
+        tags = import_tags(track, matcher.match(track), args.min_confidence)
         if payload := listenbrainz.listen(track, tags, context):
             yield number, payload
         else:

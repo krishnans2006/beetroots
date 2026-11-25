@@ -28,8 +28,8 @@ _CATALOG_NUMBER = re.compile(
 
 
 def key(value: str) -> str:
-    value = value.translate(_APOSTROPHES).casefold().replace("&", " and ")
-    folded = unicodedata.normalize("NFKD", value)
+    value = value.translate(_APOSTROPHES).replace("&", " and ")
+    folded = unicodedata.normalize("NFKD", value).casefold()
     return "".join(char for char in folded if char.isalnum())
 
 
@@ -119,4 +119,13 @@ def names_from_credits(credits: list[dict]) -> list[str]:
         for credit in credits
         for name in (credit.get("name"), (credit.get("artist") or {}).get("name"))
         if name
+    ]
+
+
+def appearance_names(track: dict, release: dict) -> list[str]:
+    """Credits that explain a source album artist on this release."""
+    return [
+        name
+        for entity in (track, release)
+        for name in names_from_credits(entity.get("artist-credit") or [])
     ]
