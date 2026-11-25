@@ -58,14 +58,15 @@
               venvVersionWarn
             '';
 
-            packages = [
-              python.pkgs.venvShellHook
-              python.pkgs.pip
-              python.pkgs.setuptools
+            packages = with python.pkgs; [
+              venvShellHook
+              pip
+              setuptools
+              ipykernel
 
-              python.pkgs.beets
-              python.pkgs.mutagen
-              python.pkgs.ytmusicapi
+              beets
+              mutagen
+              ytmusicapi
             ];
           };
         }
