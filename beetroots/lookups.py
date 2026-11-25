@@ -171,6 +171,19 @@ class MusicBrainz(MusicBrainzAPI):
     def recording_core(self, mbid: str) -> dict | None:
         return self.raw(f"recording/{mbid}", inc=RECORDING_CORE)
 
+    def recordings_by_credit(
+        self, artist: str, title: str, *, limit: int
+    ) -> list[dict]:
+        def phrase(value: str) -> str:
+            return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+        credit = phrase(artist)
+        query = f"recording:{phrase(title)} AND (artistname:{credit} OR creditname:{credit})"
+        result = self.raw("recording", query=query, limit=limit)
+        if result is None:
+            raise HTTPNotFoundError()
+        return result["recordings"]
+
     def release_core(self, mbid: str) -> dict | None:
         return self.raw(f"release/{mbid}", inc=RELEASE_CORE)
 

@@ -120,11 +120,17 @@ class MatchResult:
                     artists.extend(
                         alias.get("name") for alias in (artist.get("aliases") or [])
                     )
-            if not agrees(
-                [track.get("title", ""), *track.get("alternate_titles", [])],
-                track.get("artist", ""),
-                titles,
-                artists,
+            source_titles = [track.get("title", ""), *track.get("alternate_titles", [])]
+            linked = self.recording_mbid and (
+                self.provenance.get("spotify_recording_link") == self.recording_mbid
+            )
+            if not (
+                agrees(source_titles, track.get("artist", ""), titles, artists)
+                or (
+                    linked
+                    and any(source_titles)
+                    and agrees(source_titles, "", titles, [])
+                )
             ):
                 return tags
         tags.update(proposal)

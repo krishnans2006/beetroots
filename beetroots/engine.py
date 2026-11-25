@@ -64,6 +64,7 @@ class MatchRun:
         self.provenance: dict = {"input": track, "providers": {}}
         self.aliases: dict[str, str] = {}
         self.browse_releases: dict[str, dict] = {}
+        self.spotify_recordings: set[str] = set()
 
     def issue(self, path: str, code: str, detail: str) -> None:
         issue = MatchIssue(path=path, code=code, detail=detail)
@@ -495,6 +496,13 @@ class MatchRun:
             for relation in (response or {}).get("relations") or []:
                 if recording := relation.get("recording"):
                     add(path, [recording])
+                    stream_id = url.removeprefix("https://open.spotify.com/track/")
+                    if (
+                        SPOTIFY_ID.fullmatch(stream_id)
+                        and not relation.get("ended")
+                        and MBID.fullmatch(recording.get("id", ""))
+                    ):
+                        self.spotify_recordings.add(recording["id"])
                 elif release := relation.get("release"):
                     if payload := self.lookup(
                         path, self.mb.release_core, release["id"]
@@ -650,9 +658,9 @@ class MatchRun:
             path = "text.artistname"
             results = self.lookup(
                 path,
-                self.mb.search,
-                "recording",
-                {"artistname": source.artist, "recording": base_title(titles[0])},
+                self.mb.recordings_by_credit,
+                source.artist,
+                base_title(titles[0]),
                 limit=self.engine.settings.search_limit,
             )
             add_hits(results or [], path)
@@ -710,23 +718,6 @@ class MatchRun:
     def score(
         self, candidates: list[Candidate], item: Item, titles: list[str]
     ) -> tuple[str, float, Appearance | None] | None:
-        for key in ("version", "disambiguation"):
-            if requested := self.evidence.get(key):
-                states = [
-                    version_match(
-                        requested,
-                        candidate.info.title or "",
-                        candidate.info.trackdisambig or "",
-                    )
-                    for candidate in candidates
-                ]
-                if True in states:
-                    candidates = [
-                        candidate
-                        for candidate, state in zip(candidates, states)
-                        if state is not False
-                    ]
-
         requested_artists = set(
             filter(
                 None, [self.evidence.get("artist_mbid"), *self.evidence["artist_mbids"]]
@@ -760,6 +751,30 @@ class MatchRun:
                 )
             ]
 
+        def recording_titles(candidate: Candidate) -> list[str | None]:
+            return [
+                candidate.info.title,
+                *(
+                    alias.get("name")
+                    for alias in (candidate.recording.get("aliases") or [])
+                ),
+            ]
+
+        linked_ids = {self.aliases.get(mbid, mbid) for mbid in self.spotify_recordings}
+        linked = None
+        if titles and len(linked_ids) == 1:
+            linked = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.info.track_id in linked_ids
+                    and agrees(titles, "", recording_titles(candidate), [])
+                ),
+                None,
+            )
+        if linked is not None:
+            candidates = [linked]
+
         # A release can narrow editions of the same song. An album match
         # should not promote a different song over one with matching credits.
         if titles and item.artist:
@@ -769,13 +784,7 @@ class MatchRun:
                 if agrees(
                     titles,
                     item.artist,
-                    [
-                        candidate.info.title,
-                        *(
-                            alias.get("name")
-                            for alias in (candidate.recording.get("aliases") or [])
-                        ),
-                    ],
+                    recording_titles(candidate),
                     [
                         candidate.info.artist,
                         *names_from_credits(
@@ -786,6 +795,25 @@ class MatchRun:
             ]
             if same_song:
                 candidates = same_song
+
+        # Compare versions only after establishing which candidates share
+        # the song. A live version of another song is still another song.
+        for qualifier in ("version", "disambiguation"):
+            if requested := self.evidence.get(qualifier):
+                states = [
+                    version_match(
+                        requested,
+                        candidate.info.title or "",
+                        candidate.info.trackdisambig or "",
+                    )
+                    for candidate in candidates
+                ]
+                if True in states:
+                    candidates = [
+                        candidate
+                        for candidate, state in zip(candidates, states)
+                        if state is not False
+                    ]
 
         options = {}
         values = self.edition_values()
@@ -842,6 +870,8 @@ class MatchRun:
         # min keeps the first candidate at a tied beets distance.
         distance, winner, selected = min(matches, key=lambda match: match[0])
         self.provenance["candidate_paths"] = sorted(winner.paths)
+        if winner is linked:
+            self.provenance["spotify_recording_link"] = winner.info.track_id
         return winner.info.track_id, float(distance), selected
 
     def finish(

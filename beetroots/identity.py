@@ -4,31 +4,43 @@ import re
 import unicodedata
 from collections.abc import Iterable
 
-_TITLE_SUFFIX = re.compile(
-    r"\s*[([]([^()\[\]]+)[)\]]$|\s+[-–—]\s+((?:(?!\s+[-–—]\s+).)+)$"
-)
+_BRACKET_SUFFIX = re.compile(r"\s*[([]([^()\[\]]+)[)\]]$")
+_DASH_SUFFIX = re.compile(r"\s+[-–—]\s+((?:(?!\s+[-–—]\s+).)+)$")
+_TRAILING_DASH = re.compile(r"\s+[-–—]$")
 _VERSION = re.compile(
-    r"\b(?:live|remix\w*|remaster\w*|acoustic|instrumental|demo|radio edit|"
-    r"soundtrack version|album version|single version|mono|stereo|unplugged|"
-    r"japanese version|english version)\b",
+    r"^(?:live(?:\s+(?:(?:at|from|in|on|version)\b|\d{4}\b).*)?|"
+    r"live\s+studio\s+ver(?:sion)?\b.*|live\s+.+\btour\s+\d{4}|"
+    r"acoustic(?: version)?|instrumental(?: version)?|"
+    r"demo(?: version)?|mono|stereo|unplugged|bonus track|theme song|"
+    r"(?:theme from|recorded at)\s+.+)$"
+    r"|\b(?:remix|remaster(?:ed)?|mix|edit|version)\s*(?:\d{4})?$",
     re.IGNORECASE,
 )
 _CREDIT = re.compile(r"\b(?:feat\.?|ft\.?|featuring|with|from)\s+", re.IGNORECASE)
+# Modifier-letter apostrophes are alphanumeric in Unicode. They serve the
+# same purpose as straight and curly apostrophes in many catalog credits.
+_APOSTROPHES = str.maketrans("", "", "ʻʼʹꞌ")
+_OPUS = re.compile(r"\bop\.?\s*\d+", re.IGNORECASE)
+_CATALOG_NUMBER = re.compile(
+    r",?\s+\b(?:B|D|H|K|KV|RV|BWV|WoO)\.?\s*\d+[a-z]?\b",
+    re.IGNORECASE,
+)
 
 
 def key(value: str) -> str:
-    folded = unicodedata.normalize("NFKD", value.casefold().replace("&", " and "))
+    value = value.translate(_APOSTROPHES).casefold().replace("&", " and ")
+    folded = unicodedata.normalize("NFKD", value)
     return "".join(char for char in folded if char.isalnum())
 
 
 def base_title(title: str) -> str:
     """Remove trailing credit, soundtrack and version text, keeping work numbers."""
     title = title.strip()
-    while match := _TITLE_SUFFIX.search(title):
-        qualifier = next(value for value in match.groups() if value is not None)
+    while match := _BRACKET_SUFFIX.search(title) or _DASH_SUFFIX.search(title):
+        qualifier = match[1].strip()
         if not (_CREDIT.match(qualifier) or _VERSION.search(qualifier)):
             break
-        title = title[: match.start()].rstrip()
+        title = _TRAILING_DASH.sub("", title[: match.start()].rstrip())
     return title
 
 
@@ -56,6 +68,23 @@ def credit_keys(name: str) -> set[str]:
     return {key(name), key(main), key(bare)} - {""}
 
 
+def same_title(left: str, right: str, source_artist: str, names: list[str]) -> bool:
+    if title_keys(left, [source_artist]) & title_keys(right, names):
+        return True
+    # Some catalogs give both an opus and a second catalog number, while
+    # others give only the opus. Keep the work and movement text intact.
+    left, right = base_title(left), base_title(right)
+    if not (_OPUS.search(left) and _OPUS.search(right)):
+        return False
+    one_catalog = bool(_CATALOG_NUMBER.search(left)) != bool(
+        _CATALOG_NUMBER.search(right)
+    )
+    return one_catalog and bool(
+        title_keys(_CATALOG_NUMBER.sub("", left), [source_artist])
+        & title_keys(_CATALOG_NUMBER.sub("", right), names)
+    )
+
+
 def agrees(
     source_titles: Iterable[str],
     source_artist: str,
@@ -64,15 +93,20 @@ def agrees(
 ) -> bool:
     """Check each observed source field against the recording or a known alias."""
     names = [name for name in names if name]
-    requested_titles = set().union(
-        *(title_keys(title, [source_artist]) for title in source_titles if title)
-    )
+    requested_titles = [
+        title for title in source_titles if title_keys(title, [source_artist])
+    ]
     requested_artist = credit_keys(source_artist)
     if not (requested_titles or requested_artist):
         return False
     return (
         not requested_titles
-        or any(requested_titles & title_keys(title, names) for title in titles if title)
+        or any(
+            same_title(requested, title, source_artist, names)
+            for title in titles
+            if title
+            for requested in requested_titles
+        )
     ) and (
         not requested_artist
         or any(requested_artist & credit_keys(name) for name in names)

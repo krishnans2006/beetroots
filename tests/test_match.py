@@ -1,3 +1,5 @@
+"""Matcher tests using invented metadata and synthetic provider responses."""
+
 import json
 import os
 import subprocess
@@ -10,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from beetroots import Matcher, MatcherConfig
+from beetroots.identity import agrees
 
 
 def mbid(number):
@@ -532,7 +535,9 @@ class MatchTests(unittest.TestCase):
         ] = {
             "recordings": [{"id": ALBUM_REC}],
         }
-        self.responses["/ws/2/recording?artistname:(the act) recording:(signal)"] = {
+        self.responses[
+            '/ws/2/recording?recording:"Signal" AND (artistname:"The Act" OR creditname:"The Act")'
+        ] = {
             "recordings": [{"id": STUDIO}],
         }
         self.save_responses()
@@ -553,6 +558,81 @@ class MatchTests(unittest.TestCase):
                 min_confidence=0,
                 require_song_agreement=True,
             ),
+        )
+
+    def test_version_suffixes_leave_the_recording_title_intact(self):
+        title = "Fixture Recording Alpha"
+        artist = "Fixture Performer"
+        for suffix in (
+            " - Pop Version",
+            " - (Remix)",
+            " - Live Fixture Tour 2099",
+            " (live studio ver.)",
+            " - Bonus Track",
+            " (Theme from Fixture Film)",
+        ):
+            with self.subTest(suffix=suffix):
+                self.assertTrue(agrees([title + suffix], artist, [title], [artist]))
+        self.assertFalse(
+            agrees(
+                [f"{title} / Fixture Recording Beta"],
+                artist,
+                ["Fixture Recording Beta"],
+                [artist],
+            )
+        )
+
+    def test_modifier_letter_apostrophe_in_credit(self):
+        title = "Fixture Recording Alpha"
+        self.assertTrue(agrees([title], "Fixture'A", [title], ["FixtureʻA"]))
+
+    def test_secondary_catalog_numbers_preserve_work_and_movement_identity(self):
+        artist = "Fixture Performer"
+        work = "Fixture Chamber Work, Op. 901"
+        plain = f"{work}: I. Fixture Movement"
+        for prefix in ("B.", "RV"):
+            with self.subTest(prefix=prefix):
+                numbered = f"{work}, {prefix} 271: I. Fixture Movement"
+                self.assertTrue(agrees([numbered], artist, [plain], [artist]))
+                self.assertTrue(agrees([plain], artist, [numbered], [artist]))
+                for candidate in (
+                    f"{work}, {prefix} 272: I. Fixture Movement",
+                    f"{work}: II. Fixture Movement",
+                    "Fixture Chamber Work, Op. 902: I. Fixture Movement",
+                ):
+                    self.assertFalse(agrees([numbered], artist, [candidate], [artist]))
+
+    def test_spotify_recording_link_requires_title_corroboration(self):
+        track_id = "00aaaaaaaaaaaaaaaaaaaa"
+        url = f"https://open.spotify.com/track/{track_id}"
+        self.responses[f"/ws/2/url?{url}"] = {
+            "relations": [{"recording": {"id": STUDIO}}],
+        }
+        self.save_responses()
+        matcher = self.matcher()
+        track = {"title": "Signal", "artist": "Different Credit", "source_urls": [url]}
+        result = matcher.match(track)
+        self.assertEqual(result.recording_mbid, STUDIO)
+        self.assertEqual(
+            result.tags_for(track, min_confidence=0, require_song_agreement=True).get(
+                "recording_mbid"
+            ),
+            STUDIO,
+        )
+        wrong = {**track, "title": "Different Song", "artist": "The Act"}
+        result = matcher.match(wrong)
+        self.assertNotIn(
+            "recording_mbid",
+            result.tags_for(wrong, min_confidence=0, require_song_agreement=True),
+        )
+        self.responses[f"/ws/2/url?{url}"]["relations"].append(
+            {"recording": {"id": EXACT}}
+        )
+        self.save_responses()
+        result = self.matcher(cache=self.path / "ambiguous.sqlite3").match(track)
+        self.assertNotIn(
+            "recording_mbid",
+            result.tags_for(track, min_confidence=0, require_song_agreement=True),
         )
 
     def test_stable_order_and_isolated_configuration(self):
