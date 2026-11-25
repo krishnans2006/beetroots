@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Literal, NotRequired, TypedDict
 
+from .identity import agrees, names_from_credits
+
 VERSION = "0.1.0"
 BEETS_VERSION = "2.14.1"
 
@@ -87,6 +89,46 @@ class MatchResult:
     proposed_tags: dict | None = None
     provenance: dict = field(default_factory=dict)
     issues: list[MatchIssue] = field(default_factory=list)
+
+    def tags_for(
+        self,
+        track: TrackInput,
+        *,
+        min_confidence: float,
+        require_song_agreement: bool = False,
+    ) -> dict:
+        """Apply a sufficiently confident proposal over the source's display tags."""
+        tags = {
+            key: track[key] for key in ("title", "artist", "album") if track.get(key)
+        }
+        proposal = self.proposed_tags
+        if not proposal or self.confidence is None or self.confidence < min_confidence:
+            return tags
+        if require_song_agreement and self.method == "metadata":
+            metadata = self.metadata or {}
+            recording = metadata.get("recording") or {}
+            titles = [proposal.get("title"), proposal.get("release_track_title")]
+            titles.extend(
+                alias.get("name") for alias in (recording.get("aliases") or [])
+            )
+            artists = [
+                proposal.get("artist"),
+                *names_from_credits(proposal.get("artist_credits", [])),
+            ]
+            for artist in metadata.get("entities", {}).get("artist", {}).values():
+                if artist.get("id") in proposal.get("artist_mbids", []):
+                    artists.extend(
+                        alias.get("name") for alias in (artist.get("aliases") or [])
+                    )
+            if not agrees(
+                [track.get("title", ""), *track.get("alternate_titles", [])],
+                track.get("artist", ""),
+                titles,
+                artists,
+            ):
+                return tags
+        tags.update(proposal)
+        return tags
 
 
 def validate(track: object) -> str | None:

@@ -526,6 +526,35 @@ class MatchTests(unittest.TestCase):
             tied["provenance"]["candidate_paths"], ["isrc:GBABC0123456", "text"]
         )
 
+    def test_credit_search_and_song_agreement(self):
+        self.responses[
+            "/ws/2/recording?artist:(the act) recording:(signal) alias:(signal)"
+        ] = {
+            "recordings": [{"id": ALBUM_REC}],
+        }
+        self.responses["/ws/2/recording?artistname:(the act) recording:(signal)"] = {
+            "recordings": [{"id": STUDIO}],
+        }
+        self.save_responses()
+        matcher = self.matcher()
+        source = {"artist": "The Act", "title": "Signal (from the soundtrack)"}
+        result = matcher.match(source)
+        self.assertEqual(result.recording_mbid, STUDIO)
+        self.assertEqual(
+            result.tags_for(source, min_confidence=0, require_song_agreement=True)[
+                "recording_mbid"
+            ],
+            STUDIO,
+        )
+        self.assertNotIn(
+            "recording_mbid",
+            result.tags_for(
+                {**source, "title": "Another Song"},
+                min_confidence=0,
+                require_song_agreement=True,
+            ),
+        )
+
     def test_stable_order_and_isolated_configuration(self):
         track = {
             "title": "Signal",

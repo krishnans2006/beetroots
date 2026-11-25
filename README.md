@@ -61,3 +61,30 @@ Use a `MatcherConfig` in Python or pass a JSON object with the same fields via `
 Each matcher runs beets in a dedicated process. Results include its matcher version and effective configuration fingerprint. The default cache is `$XDG_CACHE_HOME/beetroots/lookups.sqlite3` or `~/.cache/beetroots/lookups.sqlite3`. Workers using the same cache reuse successful and empty responses. Temporary failures can be retried on the next match. Pass `refresh=True` to `Matcher` or `--refresh` to refresh the lookups used in a run. Workers share the MusicBrainz request limiter within the same cache home.
 
 Run the recorded-response tests with `python -m unittest discover -s tests -v`.
+
+## Import Spotify history
+
+Run the Spotify wrapper from the repository root with a single streaming-history JSON file. The default output is JSON Lines, with one ListenBrainz `import` request body per line. With Beetroots installed, you can also run `python roots/spotify.py` directly.
+
+```sh
+python -m roots.spotify data/Streaming_History_Audio_2020.json --limit 10 > listens.jsonl
+```
+
+To submit directly, set `LISTENBRAINZ_TOKEN` to your ListenBrainz token or Koito API key and pass the API URL.
+
+```sh
+python -m roots.spotify data/Streaming_History_Audio_2020.json \
+  --submit http://localhost:4110/apis/listenbrainz/1
+```
+
+The wrapper accepts Spotify’s extended and basic history formats. It estimates playback start from the exported end time and sends elapsed playback as `duration_played_ms`. Full track duration comes from Beetroots. Beetroots applies a MusicBrainz proposal when the source title and credit agree with the recording. It accepts equivalent punctuation, known aliases, and common version suffixes. Spotify text supplies missing fields and covers rejected or unmatched results. The default confidence floor is **0.0**. Use `--min-confidence` to raise it while retaining the title and credit check. [Spotify export fields](https://support.spotify.com/us/article/understanding-your-data/) · [ListenBrainz request fields](https://listenbrainz.readthedocs.io/en/latest/users/json.html)
+
+Podcasts, audiobooks, zero-playback rows, and malformed entries are skipped. Positive short plays are kept. Add `--include-incognito` to include private-session listens and `--include-ip` to carry IP addresses in the Spotify-specific request metadata. The demo Koito build accepts this context in the request and stores a subset of the submitted fields. The wrapper reports counts and errors on stderr.
+
+Use `--start-row` and `--limit` to select a one-based range of source rows. In submission mode, the wrapper reports the range for each acknowledged batch and stops on a failed batch. Check those rows on the server before retrying a request with an unknown outcome.
+
+### Spotify matching audit
+
+The five exports were run through the wrapper against a local replay of the [November 17, 2026 canonical MusicBrainz snapshot](https://metabrainz.org/datasets/derived-dumps). Read-only indexed MusicBrainz searches and a second pass over disputed results supplied additional evidence. The replay validates the wrapper and Beetroots against a fixed catalog. Live search ordering and full release metadata can vary.
+
+The old cutoff of 0.68 let an exact artist credit carry a different song title above the threshold. It also discarded valid ensemble credits that Spotify shortened to one artist. The importer now checks the title and credit separately before applying an MBID. The matcher also searches the credited artist individually when its ordinary search returns no same-song result. With the agreement check in place, raising the numeric cutoff dropped verified songs without removing any additional observed wrong-song tags in the replay.

@@ -27,6 +27,7 @@ from .evidence import (
     version_evidence,
     version_match,
 )
+from .identity import agrees, base_title, names_from_credits
 from .lookups import LookupFailure
 from .metadata import artist_ids, collect_metadata, proposed_tags
 from .schema import MatchIssue, MatchResult, TrackInput
@@ -607,6 +608,13 @@ class MatchRun:
 
     def find_candidates(self, source: Source, titles: list[str]) -> list[Candidate]:
         text_hits: dict[str, list[tuple[str, dict]]] = {}
+
+        def add_hits(hits: list[dict], path: str) -> None:
+            for hit in hits:
+                identifier = hit.get("id")
+                if identifier and MBID.fullmatch(identifier):
+                    text_hits.setdefault(identifier, []).append((path, hit))
+
         for title in titles or [""]:
             if not title and not source.artist:
                 continue
@@ -619,10 +627,35 @@ class MatchRun:
                 title,
                 False,
             )
-            for hit in results or []:
-                identifier = hit.get("id")
-                if identifier and MBID.fullmatch(identifier):
-                    text_hits.setdefault(identifier, []).append(("text", hit))
+            add_hits(results or [], "text")
+        # A Spotify artist can be a single performer from a longer MusicBrainz
+        # credit. The ordinary combined-credit search can miss that recording.
+        if (
+            source.artist
+            and titles
+            and not any(
+                agrees(
+                    titles,
+                    source.artist,
+                    [hit.get("title")],
+                    [
+                        display_credit(hit.get("artist-credit"), "joinphrase"),
+                        *names_from_credits(hit.get("artist-credit") or []),
+                    ],
+                )
+                for hits in text_hits.values()
+                for _, hit in hits
+            )
+        ):
+            path = "text.artistname"
+            results = self.lookup(
+                path,
+                self.mb.search,
+                "recording",
+                {"artistname": source.artist, "recording": base_title(titles[0])},
+                limit=self.engine.settings.search_limit,
+            )
+            add_hits(results or [], path)
         supplemental_hits = self.supplemental(titles)
         candidates: dict[str, Candidate] = {}
         text_order = []
@@ -726,6 +759,33 @@ class MatchRun:
                     for relation in candidate.recording["relations"]
                 )
             ]
+
+        # A release can narrow editions of the same song. An album match
+        # should not promote a different song over one with matching credits.
+        if titles and item.artist:
+            same_song = [
+                candidate
+                for candidate in candidates
+                if agrees(
+                    titles,
+                    item.artist,
+                    [
+                        candidate.info.title,
+                        *(
+                            alias.get("name")
+                            for alias in (candidate.recording.get("aliases") or [])
+                        ),
+                    ],
+                    [
+                        candidate.info.artist,
+                        *names_from_credits(
+                            candidate.recording.get("artist-credit", [])
+                        ),
+                    ],
+                )
+            ]
+            if same_song:
+                candidates = same_song
 
         options = {}
         values = self.edition_values()
@@ -897,7 +957,12 @@ class MatchRun:
             track=self.evidence.get("track_number") or 0,
             data_source=self.plugin.data_source,
         )
-        candidates = self.find_candidates(Source.from_item(item), titles)
+        search_titles = list(
+            dict.fromkeys(
+                term for title in titles for term in (title, base_title(title)) if term
+            )
+        )
+        candidates = self.find_candidates(Source.from_item(item), search_titles)
         if not candidates:
             if any(issue["code"] == "lookup_error" for issue in self.issues):
                 return self.result("lookup_error")
