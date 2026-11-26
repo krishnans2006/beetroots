@@ -789,6 +789,128 @@ class MatchTests(unittest.TestCase):
             spotify.import_tags(plain, matcher.match(plain), 0)["recording_mbid"], LIVE
         )
 
+    def test_stream_recording_id_is_independent_of_the_source_edition(self):
+        original = {**recording(STUDIO, "Signal"), "first-release-date": "2001"}
+        remaster = {
+            **recording(OLD, "Signal (2020 Remaster)", length=244300),
+            "first-release-date": "2020",
+        }
+        clean = {
+            **recording(EXACT, "Signal", disambiguation="clean"),
+            "first-release-date": "1999",
+        }
+        candidates = [remaster, clean, original]
+        for rec, edition_id, album, date, track_id in (
+            (original, EARLY, "Signal Album", "2001", FIRST),
+            (remaster, REISSUE, "Best of The Act", "2020", REISSUE_TRACK),
+            (clean, LATE, "Signal Clean Edition", "1999", LATE_TRACK),
+        ):
+            recording_path = f"/ws/2/recording/{rec['id']}"
+            self.responses[recording_path] = rec
+            self.responses[f"{recording_path}?canonical"] = rec
+            edition = release(edition_id, album, date, [track(track_id, 1, rec)])
+            self.responses[f"/ws/2/release/{edition_id}"] = edition
+            self.responses[f"/ws/2/release?{rec['id']}:0"] = {
+                "release-count": 1,
+                "releases": [edition],
+            }
+        self.responses[
+            "/ws/2/recording?artist:(the act) recording:(signal) alias:(signal)"
+        ] = {"recordings": candidates}
+        self.responses[f"watch:{YOUTUBE}"]["tracks"][1].update(
+            title="Signal",
+            album={"name": "Signal Album (Deluxe Edition)", "id": "fixture-album"},
+            videoType="MUSIC_VIDEO_TYPE_ATV",
+        )
+        self.save_responses()
+        spotify_source = {
+            "source": "spotify",
+            "title": "Signal - 2020 Remaster",
+            "artist": "The Act",
+            "album": "Best of The Act",
+            "elapsed_ms": 311,
+        }
+        youtube_source = {
+            "video_title": "Signal",
+            "uploader": "The Act - Topic",
+            "duration_ms": 245000,
+            "youtube_video_id": YOUTUBE,
+        }
+        matcher = self.matcher()
+        from_spotify = matcher.match(spotify_source)
+        from_youtube = matcher.match(youtube_source)
+        self.assertEqual(from_spotify.recording_mbid, STUDIO)
+        self.assertEqual(from_youtube.recording_mbid, STUDIO)
+        self.assertEqual(from_youtube.edition["release_track_mbid"], FIRST)
+        clean_source = {
+            **spotify_source,
+            "title": "Signal",
+            "album": "Signal Clean Edition",
+        }
+        self.assertEqual(matcher.match(clean_source).recording_mbid, EXACT)
+        self.assertEqual(
+            matcher.match({**spotify_source, "recording_mbid": OLD}).recording_mbid, OLD
+        )
+
+    def test_stream_match_uses_featured_credit_and_full_duration(self):
+        original = recording(STUDIO, "Signal")
+        mix = recording(EXACT, "Signal", [artist("The Act", ARTIST)], length=237000)
+        for rec in (original, mix):
+            self.responses[f"/ws/2/recording/{rec['id']}"] = rec
+            self.responses[f"/ws/2/recording/{rec['id']}?canonical"] = rec
+        self.responses[
+            "/ws/2/recording?artist:(the act) recording:(signal) alias:(signal)"
+        ] = {"recordings": [mix, original]}
+        watch = self.responses[f"watch:{YOUTUBE}"]["tracks"][1]
+        watch.update(title="Signal", videoType="MUSIC_VIDEO_TYPE_ATV")
+        watch.pop("album")
+        self.save_responses()
+        matcher = self.matcher()
+        spotify_source = {
+            "source": "spotify",
+            "title": "Signal (feat. Guest)",
+            "artist": "The Act",
+            "elapsed_ms": 500,
+        }
+        youtube_source = {
+            "video_title": "Signal",
+            "youtube_video_id": YOUTUBE,
+            "uploader": "The Act - Topic",
+            "duration_ms": 244000,
+        }
+        self.assertEqual(matcher.match(spotify_source).recording_mbid, STUDIO)
+        self.assertEqual(matcher.match(youtube_source).recording_mbid, STUDIO)
+
+    def test_stream_uses_exact_album_when_normalized_titles_collide(self):
+        intended = recording(STUDIO, "Signal")
+        other = recording(EXACT, "Signal", [artist("The Act", ARTIST)])
+        for rec, edition_id, album, track_id in (
+            (intended, EARLY, "Signal Album (Expanded Edition)", FIRST),
+            (other, LATE, "Signal Album (Deluxe Edition)", LATE_TRACK),
+        ):
+            self.responses[f"/ws/2/recording/{rec['id']}"] = rec
+            self.responses[f"/ws/2/recording/{rec['id']}?canonical"] = rec
+            edition = release(edition_id, album, "2001", [track(track_id, 1, rec)])
+            self.responses[f"/ws/2/release/{edition_id}"] = edition
+            self.responses[f"/ws/2/release?{rec['id']}:0"] = {
+                "release-count": 1,
+                "releases": [edition],
+            }
+        self.responses[
+            "/ws/2/recording?artist:(the act) recording:(signal) alias:(signal)"
+        ] = {"recordings": [other, intended]}
+        self.save_responses()
+        result = self.matcher().match(
+            {
+                "source": "spotify",
+                "title": "Signal",
+                "artist": "The Act",
+                "album": "Signal Album (Expanded Edition)",
+            }
+        )
+        self.assertEqual(result.recording_mbid, STUDIO)
+        self.assertEqual(result.edition["release_track_mbid"], FIRST)
+
     def test_unique_title_corroborated_isrc_prioritizes_recording(self):
         self.responses[f"/ws/2/isrc/{ISRC}"] = {
             "recordings": [{"id": EXACT}],

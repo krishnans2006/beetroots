@@ -15,6 +15,8 @@ from beets.autotag.distance import (
 )
 from beets.autotag.hooks import TrackInfo
 
+from .identity import album_key
+
 MBID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 ISRC = re.compile(r"[A-Z]{2}[A-Z0-9]{3}[0-9]{7}")
 SPOTIFY_ID = re.compile(r"[A-Za-z0-9]{22}")
@@ -275,7 +277,7 @@ EDITION_FIELDS = (
 
 
 def edition_match(
-    field: str, wanted, observed, *, normalize_album_ampersand: bool = False
+    field: str, wanted, observed, *, normalize_album: bool = False
 ) -> bool | None:
     if field == "album_artists":
         if not observed:
@@ -296,12 +298,14 @@ def edition_match(
     if not values:
         return None
     if isinstance(wanted, str):
-        if field == "album" and normalize_album_ampersand:
-            return any(
-                text_key(wanted.replace("&", " and "))
-                == text_key(value.replace("&", " and "))
-                for value in values
-            )
+        if field == "album":
+            if normalize_album:
+                return any(album_key(wanted) == album_key(value) for value in values)
+            if not text_key(wanted):
+                return any(
+                    wanted.strip().casefold() == value.strip().casefold()
+                    for value in values
+                )
         if field == "release_date":
             wanted_parts = wanted.split("-")
             unknown = False

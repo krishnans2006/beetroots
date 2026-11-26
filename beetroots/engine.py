@@ -29,11 +29,26 @@ from .evidence import (
     version_evidence,
     version_match,
 )
-from .identity import agrees, appearance_names, base_title, names_from_credits
+from .identity import (
+    agrees,
+    appearance_names,
+    base_title,
+    featured_artist,
+    mastering_label,
+    names_from_credits,
+    recording_title,
+)
+from .identity import (
+    key as identity_key,
+)
 from .lookups import LookupFailure
 from .metadata import artist_ids, collect_metadata, proposed_tags
 from .schema import MatchIssue, MatchResult, TrackInput
 from .video import VideoEvidence, compatible_version, length_difference
+
+# Streaming runtimes can be reported in whole seconds, and release tracks of
+# the same recording can have slightly different amounts of leading silence.
+CLOSE_DURATION = 2
 
 
 @dataclass
@@ -54,6 +69,51 @@ def merge_recordings(preferred: dict, fallback: dict) -> dict:
     }
 
 
+def recording_order(candidate: Candidate) -> tuple:
+    date = candidate.recording.get("first-release-date") or ""
+    return not candidate.recording.get("isrcs"), not date, date, candidate.info.track_id
+
+
+def duplicate_recording(left: Candidate, right: Candidate) -> bool:
+    """Check catalog identity before ignoring differences between editions."""
+    if (
+        bool(left.recording.get("video")) != bool(right.recording.get("video"))
+        or not left.info.length
+        or not right.info.length
+        or abs(left.info.length - right.info.length) > CLOSE_DURATION
+    ):
+        return False
+    title = identity_key(recording_title(left.info.title or ""))
+    credits = set(artist_ids(left.recording))
+    if (
+        not title
+        or title != identity_key(recording_title(right.info.title or ""))
+        or not credits
+        or credits != set(artist_ids(right.recording))
+    ):
+        return False
+
+    def description(candidate):
+        notes = candidate.info.trackdisambig or ""
+        return "" if mastering_label(notes) else identity_key(notes)
+
+    if description(left) != description(right):
+        return False
+    left_isrcs = set(left.recording.get("isrcs") or ())
+    right_isrcs = set(right.recording.get("isrcs") or ())
+    if left_isrcs and right_isrcs and left_isrcs.isdisjoint(right_isrcs):
+        return False
+    works = [
+        {
+            relation["work"]["id"]
+            for relation in candidate.recording.get("relations") or []
+            if (relation.get("work") or {}).get("id")
+        }
+        for candidate in (left, right)
+    ]
+    return not all(works) or bool(works[0] & works[1])
+
+
 class MatchRun:
     def __init__(self, engine, track: TrackInput):
         self.engine = engine
@@ -71,6 +131,10 @@ class MatchRun:
         self.isrc_recordings: set[str] = set()
         self.video_recordings: set[str] = set()
         self.video: VideoEvidence | None = None
+
+    @property
+    def streaming(self) -> bool:
+        return self.evidence.get("source") == "spotify" or self.video is not None
 
     def issue(self, path: str, code: str, detail: str) -> None:
         issue = MatchIssue(path=path, code=code, detail=detail)
@@ -458,8 +522,9 @@ class MatchRun:
         self, options: dict[str, list[Appearance]], values: dict
     ) -> tuple[dict[str, list[Appearance]], Counter[str]]:
         identified: Counter[str] = Counter()
-        for key, value in values.items():
-            compared = {
+
+        def compare(key, value, normalize_album=False):
+            return {
                 mbid: [
                     (
                         appearance,
@@ -467,13 +532,24 @@ class MatchRun:
                             key,
                             value,
                             appearance.fields()[key],
-                            normalize_album_ampersand=self.video is not None,
+                            normalize_album=normalize_album,
                         ),
                     )
                     for appearance in choices
                 ]
                 for mbid, choices in options.items()
             }
+
+        for key, value in values.items():
+            compared = compare(key, value)
+            if (
+                key == "album"
+                and self.streaming
+                and not any(
+                    flag is True for choices in compared.values() for _, flag in choices
+                )
+            ):
+                compared = compare(key, value, normalize_album=True)
             if not any(
                 flag is True for choices in compared.values() for _, flag in choices
             ):
@@ -939,7 +1015,7 @@ class MatchRun:
                         "album",
                         item.album,
                         a.release.get("title"),
-                        normalize_album_ampersand=self.video is not None,
+                        normalize_album=True,
                     )
                     and song_agreement(
                         [*known_titles, a.track.get("title")],
@@ -957,8 +1033,37 @@ class MatchRun:
                 }
         if self.video and not linked:
             options = self.video_options(candidates, options, compatible, item, titles)
+        catalog_options = options
         options, identified = self.filter_editions(options, values)
-        matches = []
+        infer_recording = (
+            self.streaming
+            and not linked
+            and not any(
+                self.track.get(field)
+                for field in (
+                    "release_mbid",
+                    "release_group_mbid",
+                    "barcode",
+                    "catalog_number",
+                )
+            )
+        )
+        features = (
+            {identity_key(featured_artist(title)) for title in titles} - {""}
+            if infer_recording
+            else set()
+        )
+        version = (
+            self.evidence.get("version") or self.evidence.get("disambiguation") or ""
+        )
+        scoring_titles = (
+            list(
+                dict.fromkeys([*titles, *(recording_title(title) for title in titles)])
+            )
+            if infer_recording and (not version or mastering_label(version))
+            else titles
+        )
+        matches = {}
         wanted_versions = recording_versions(titles[0]) if spotify and titles else set()
         credits = (
             self.evidence.get("artist_credits")
@@ -967,7 +1072,9 @@ class MatchRun:
         )
         for candidate in candidates:
             mbid = candidate.info.track_id
-            if mbid not in options:
+            if mbid not in options and not (
+                infer_recording and mbid in catalog_options and mbid in same_song
+            ):
                 continue
             observed_versions = (
                 recording_versions(
@@ -982,7 +1089,14 @@ class MatchRun:
                 if self.video
                 else spotify and video
             )
-            choices = options[mbid]
+            choices = options.get(mbid, [])
+            missing_feature = bool(
+                infer_recording
+                and features
+                and not features.intersection(
+                    identity_key(name) for name in recording_names(candidate) if name
+                )
+            )
             # Prefer positively identified editions when otherwise tied.
             choices = sorted(
                 choices,
@@ -1003,26 +1117,25 @@ class MatchRun:
                 difference = None
                 missing_duration = False
                 unmatched_album = False
-                if self.video and candidate is not linked:
+                if (infer_recording and item.length) or (
+                    self.video and candidate is not linked
+                ):
+                    album_matches = selected and edition_match(
+                        "album",
+                        item.album,
+                        selected.release.get("title"),
+                        normalize_album=True,
+                    )
                     difference = length_difference(
                         item.length,
                         candidate.info.length,
                         (selected.track.get("length") or 0) / 1000
-                        if selected
+                        if album_matches
                         else None,
                     )
                     missing_duration = bool(item.length and difference is None)
                     unmatched_album = bool(
-                        item.album
-                        and (
-                            not selected
-                            or not edition_match(
-                                "album",
-                                item.album,
-                                selected.release.get("title"),
-                                normalize_album_ampersand=True,
-                            )
-                        )
+                        self.video and item.album and not album_matches
                     )
                 versions = observed_versions
                 if spotify and selected:
@@ -1043,33 +1156,58 @@ class MatchRun:
                 distance = comparison(
                     item,
                     candidate.info,
-                    titles,
+                    scoring_titles,
                     appearance,
                     credits,
                     self.evidence.get("track_number"),
                 )
                 if distance is not None:
-                    matches.append(
+                    rank = (
                         (
-                            (
-                                not song_agrees,
-                                wrong_medium,
-                                variant,
-                                unmatched_album,
-                                missing_duration,
-                                distance,
-                                difference or 0,
-                            ),
-                            candidate,
-                            selected,
-                        )
+                            not song_agrees,
+                            wrong_medium,
+                            variant,
+                            missing_feature,
+                            infer_recording
+                            and difference is not None
+                            and difference > CLOSE_DURATION,
+                        ),
+                        unmatched_album,
+                        missing_duration,
+                        distance,
+                        difference or 0,
                     )
-        if not matches:
-            return None
-        # With comparable identity evidence, preserve beets' ranking.
-        (_, _, _, _, _, distance, _), winner, selected = min(
-            matches, key=lambda match: match[0]
+                    if mbid not in matches or rank < matches[mbid][0]:
+                        matches[mbid] = (rank, candidate, selected)
+        best = min(
+            (match for mbid, match in matches.items() if mbid in options),
+            key=lambda match: match[0],
+            default=None,
         )
+        if best is None:
+            return None
+        rank, winner, selected = best
+        if (
+            infer_recording
+            and titles
+            and winner.info.track_id in same_song
+            and (not version or mastering_label(version))
+            and not any(recording_versions(title) for title in titles)
+        ):
+            # Sound-alike duplicates can be attached to different tracklists.
+            # Once beets has found the song, prefer a stable catalog entry
+            # among those that fit the same recording evidence.
+            rank, winner, selected = min(
+                (
+                    match
+                    for mbid, match in matches.items()
+                    if mbid in same_song
+                    and match[0][0] <= rank[0]
+                    and (match is best or duplicate_recording(winner, match[1]))
+                ),
+                key=lambda match: recording_order(match[1]),
+            )
+        *_, distance, _ = rank
         self.provenance["candidate_paths"] = sorted(winner.paths)
         if winner is linked:
             self.provenance[link_kind] = winner.info.track_id
@@ -1111,7 +1249,7 @@ class MatchRun:
                         "album",
                         item.album,
                         appearance.release.get("title"),
-                        normalize_album_ampersand=True,
+                        normalize_album=True,
                     )
                     else None
                 )
@@ -1274,7 +1412,7 @@ class MatchRun:
                             "album",
                             item.album,
                             occurrence.release.get("title"),
-                            normalize_album_ampersand=True,
+                            normalize_album=True,
                         )
                     )
                 )

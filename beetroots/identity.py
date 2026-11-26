@@ -18,6 +18,13 @@ _VERSION = re.compile(
 )
 _CREDIT = re.compile(r"\b(?:feat\.?|ft\.?|featuring|with|from)\s+", re.IGNORECASE)
 _FEATURE_SUFFIX = re.compile(r"\s+(?:feat\.|ft\.|featuring)\s+.+$", re.IGNORECASE)
+_FEATURE = re.compile(r"(?:feat\.?|ft\.?|featuring)\s+(.+)", re.IGNORECASE)
+_MASTERING = r"(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?"
+_ALBUM_EDITION = re.compile(
+    rf"(?:{_MASTERING}|(?:deluxe|expanded|(?:\d+(?:st|nd|rd|th)\s+)?anniversary)"
+    rf"(?:\s+re-?mastered)?)(?:\s+edition)?",
+    re.IGNORECASE,
+)
 # Modifier-letter apostrophes are alphanumeric in Unicode. They serve the
 # same purpose as straight and curly apostrophes in many catalog credits.
 _APOSTROPHES = str.maketrans("", "", "ʻʼʹꞌ")
@@ -42,6 +49,41 @@ def base_title(title: str) -> str:
         if not (_CREDIT.match(qualifier) or _VERSION.search(qualifier)):
             break
         title = _TRAILING_DASH.sub("", title[: match.start()].rstrip())
+    return _FEATURE_SUFFIX.sub("", title)
+
+
+def album_key(title: str) -> str:
+    title = title.strip()
+    while match := _BRACKET_SUFFIX.search(title) or _DASH_SUFFIX.search(title):
+        if not _ALBUM_EDITION.fullmatch(match[1].strip()):
+            break
+        title = title[: match.start()].rstrip()
+    # Some album titles consist solely of symbols.
+    return key(title) or title.casefold()
+
+
+def featured_artist(title: str) -> str:
+    if suffix := _BRACKET_SUFFIX.search(title) or _DASH_SUFFIX.search(title):
+        return match[1].strip() if (match := _FEATURE.fullmatch(suffix[1])) else ""
+    if (suffix := _FEATURE_SUFFIX.search(title)) and (
+        match := _FEATURE.fullmatch(suffix[0].strip())
+    ):
+        return match[1].strip()
+    return ""
+
+
+def mastering_label(text: str) -> bool:
+    return bool(re.fullmatch(_MASTERING, text.strip(), re.IGNORECASE))
+
+
+def recording_title(title: str) -> str:
+    """Match catalog titles while retaining audible version qualifiers."""
+    title = title.strip()
+    while match := _BRACKET_SUFFIX.search(title) or _DASH_SUFFIX.search(title):
+        suffix = match[1].strip()
+        if not (mastering_label(suffix) or _FEATURE.fullmatch(suffix)):
+            break
+        title = title[: match.start()].rstrip()
     return _FEATURE_SUFFIX.sub("", title)
 
 
