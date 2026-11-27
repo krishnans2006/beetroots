@@ -6,12 +6,17 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from argparse import Namespace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, replace
+from importlib import import_module
 from pathlib import Path
 from unittest.mock import patch
 
-from beetroots import Matcher, MatcherConfig
+from beets.autotag.hooks import TrackInfo
+
+from beetroots import Matcher, MatcherConfig, MatchResult
+from beetroots.engine import Candidate, compatible_recordings
 from beetroots.identity import agrees
 from roots import listenbrainz, spotify
 
@@ -723,7 +728,7 @@ class MatchTests(unittest.TestCase):
             agrees(["Fixture ™ Theme"], "Act", ["Fixture (TM) Theme"], ["Act"])
         )
 
-    def test_spotify_uses_source_release_credits_and_preserves_other_album_names(self):
+    def test_spotify_uses_source_release_credits_and_submits_catalog_tags(self):
         edition = self.responses[f"/ws/2/release/{ALBUM_RELEASE}"]
         appearance = edition["media"][0]["tracks"][0]
         appearance["artist-credit"] = [artist("Fixture Composer", OTHER)]
@@ -745,14 +750,15 @@ class MatchTests(unittest.TestCase):
         ]
         self.assertEqual(info["recording_mbid"], ALBUM_REC)
         self.assertEqual(info["track_mbid"], ALBUM_TRACK)
+        self.assertEqual(good["artist"], "The Act")
 
         different_album = {**source, "artist": "The Act", "album": "Source Reissue"}
         tags = spotify.import_tags(different_album, matcher.match(different_album), 0)
         metadata = listenbrainz.listen(different_album, tags, {})["track_metadata"]
-        self.assertEqual(metadata["release_name"], "Source Reissue")
+        self.assertEqual(metadata["release_name"], "Provider Album")
         self.assertEqual(metadata["additional_info"]["recording_mbid"], ALBUM_REC)
-        self.assertNotIn("release_mbid", metadata["additional_info"])
-        self.assertNotIn("track_mbid", metadata["additional_info"])
+        self.assertEqual(metadata["additional_info"]["release_mbid"], ALBUM_RELEASE)
+        self.assertEqual(metadata["additional_info"]["track_mbid"], ALBUM_TRACK)
 
         wrong_title = {**source, "title": "Different Song"}
         self.assertNotIn(
@@ -760,34 +766,153 @@ class MatchTests(unittest.TestCase):
             spotify.import_tags(wrong_title, matcher.match(wrong_title), 0),
         )
 
-    def test_spotify_prefers_audio_and_matching_edits_with_the_same_title(self):
-        alternate = recording(LIVE, "Signal", disambiguation="album version")
-        intended = recording(STUDIO, "Signal", disambiguation="single version")
-        remix = recording(ACOUSTIC, "Signal", disambiguation="club mix")
+    def test_import_roots_choose_the_same_catalog_recording_for_radio_and_album(self):
+        album = self.responses[f"/ws/2/recording/{STUDIO}"]
+        radio = {
+            **recording(EXACT, "Signal (Radio Edit)", length=230000),
+            "first-release-date": "1999",
+            "isrcs": ["USABC0123457"],
+        }
+        album.update(
+            isrcs=[ISRC],
+            disambiguation="studio recording from a television performance",
+        )
+        self.responses[f"/ws/2/recording/{STUDIO}?canonical"].update(album)
+        self.responses[f"/ws/2/recording/{EXACT}"] = radio
         video = {
-            **recording(EXACT, "Signal", disambiguation="single version"),
+            **recording(OLD, "Signal (Official Music Video)", length=243000),
             "video": True,
         }
-        for candidate in (alternate, intended, remix, video):
-            self.responses[f"/ws/2/recording/{candidate['id']}"] = candidate
-        self.responses[
-            "/ws/2/recording?artist:(the act) recording:(signal) alias:(signal)"
-        ] = {"recordings": [remix, alternate, video, intended]}
+        longer = {
+            **recording(ACOUSTIC, "Signal", length=249000),
+            "first-release-date": "1998",
+            "isrcs": [ISRC],
+        }
+        self.responses[f"/ws/2/recording/{OLD}"] = video
+        self.responses[f"/ws/2/recording/{ACOUSTIC}"] = longer
+        self.responses[f"/ws/2/recording?recording:(signal) arid:({ARTIST})"] = {
+            "recordings": [video, radio, longer, album]
+        }
+        spotify_url = f"https://open.spotify.com/track/{SPOTIFY}"
+        self.responses[f"/ws/2/url?{spotify_url}"] = {
+            "relations": [{"recording": {"id": EXACT}}],
+        }
+        self.responses[f"/v1/tracks/{SPOTIFY}"].update(
+            name=radio["title"], duration_ms=227000, album={"name": "Single"}
+        )
+        youtube_url = f"https://www.youtube.com/watch?v={DELETED}"
+        self.responses[f"/ws/2/url?{youtube_url}"] = {
+            "relations": [{"recording": {"id": OLD}, "type": "free streaming"}],
+        }
         self.save_responses()
         matcher = self.matcher()
+        spotify_row = {
+            "ts": "2024-01-01T00:00:07Z",
+            "ms_played": 7000,
+            "spotify_track_uri": f"spotify:track:{SPOTIFY}",
+            "master_metadata_track_name": radio["title"],
+            "master_metadata_album_artist_name": "The Act",
+            "master_metadata_album_album_name": "Single",
+        }
+        youtube_row = {
+            "timestampMicroseconds": "1704067200000000",
+            "videoId": DELETED,
+            "title": "Signal",
+            "channels": [{"name": "The Act - Topic"}],
+            "durationLabel": "4:03",
+            "videoProgressPercent": 10,
+        }
+        args = Namespace(
+            start_row=1,
+            include_incognito=False,
+            include_ip=False,
+            min_confidence=listenbrainz.DEFAULT_MIN_CONFIDENCE,
+        )
+        youtube = import_module("roots.youtube-custom")
+        _, from_spotify = next(spotify.listens([spotify_row], matcher, args))
+        _, from_youtube = next(youtube.listens([youtube_row], matcher, args))
+        for payload in (from_spotify, from_youtube):
+            self.assertEqual(payload["listened_at"], 1704067200)
+            metadata = payload["track_metadata"]
+            self.assertEqual(metadata["track_name"], "Signal")
+            self.assertEqual(metadata["artist_name"], "The Act feat. Guest")
+            self.assertEqual(metadata["release_name"], "Signal Album")
+            info = metadata["additional_info"]
+            self.assertEqual(info["recording_mbid"], STUDIO)
+            self.assertEqual(info["isrc"], ISRC)
+            self.assertEqual(info["track_mbid"], FIRST)
+            self.assertEqual(info["duration_ms"], 244000)
+        spotify_info = from_spotify["track_metadata"]["additional_info"]
+        youtube_info = from_youtube["track_metadata"]["additional_info"]
+        self.assertEqual(spotify_info["origin_url"], spotify_url)
+        self.assertEqual(spotify_info["duration_played_ms"], 7000)
+        self.assertEqual(youtube_info["youtube_progress_percent"], 10)
+        track_input, _ = spotify.spotify_play(spotify_row, 1, False)
+        result = matcher.match(track_input)
+        self.assertEqual(result.provenance["source_recording_mbid"], EXACT)
+        track_input, _ = youtube.youtube_play(youtube_row, 1)
+        result = matcher.match(track_input)
+        self.assertEqual(result.provenance["source_recording_mbid"], OLD)
+
+    def test_spotify_withholds_a_different_named_mix(self):
+        mix = recording(ACOUSTIC, "Signal", disambiguation="club mix")
+        self.responses[f"/ws/2/recording/{ACOUSTIC}"] = mix
+        self.responses[
+            "/ws/2/recording?artist:(the act) recording:(signal) alias:(signal)"
+        ] = {"recordings": [mix]}
+        self.save_responses()
         source = {
             "source": "spotify",
+            "title": "Signal (Night Mix)",
             "artist": "The Act",
-            "title": "Signal - Single Version",
         }
+        result = self.matcher().match(source)
         self.assertEqual(
-            spotify.import_tags(source, matcher.match(source), 0)["recording_mbid"],
-            STUDIO,
+            spotify.import_tags(source, result, 0),
+            {"title": source["title"], "artist": source["artist"]},
         )
-        plain = {**source, "title": "Signal"}
-        self.assertEqual(
-            spotify.import_tags(plain, matcher.match(plain), 0)["recording_mbid"], LIVE
+
+    def test_audio_video_comparison_checks_both_titles_for_a_live_version(self):
+        audio = Candidate(
+            TrackInfo(title="Signal Live", track_id=STUDIO, length=244),
+            recording(STUDIO, "Signal Live"),
         )
+        video = Candidate(
+            TrackInfo(title="Signal (Live)", track_id=LIVE, length=244),
+            {**recording(LIVE, "Signal (Live)"), "video": True},
+        )
+        self.assertFalse(compatible_recordings(audio, video))
+        self.assertFalse(compatible_recordings(video, audio))
+
+    def test_listen_uses_source_tags_and_duration_only_on_rejection(self):
+        track_input = {
+            "title": "Signal (Radio Edit)",
+            "artist": "The Act",
+            "album": "Single",
+            "duration_ms": 230000,
+            "listened_at": 1704067200,
+        }
+        result = MatchResult(
+            None,
+            "matched",
+            "",
+            recording_mbid=STUDIO,
+            confidence=0.9,
+            proposed_tags={
+                "recording_mbid": STUDIO,
+                "title": "Signal",
+                "artist": "The Act feat. Guest",
+            },
+        )
+        accepted = result.tags_for(track_input, min_confidence=0.8)
+        payload = listenbrainz.listen(track_input, accepted, {})["track_metadata"]
+        self.assertNotIn("release_name", payload)
+        self.assertNotIn("duration_ms", payload["additional_info"])
+        rejected = result.tags_for(track_input, min_confidence=0.95)
+        payload = listenbrainz.listen(track_input, rejected, {})["track_metadata"]
+        self.assertEqual(payload["track_name"], track_input["title"])
+        self.assertEqual(payload["release_name"], track_input["album"])
+        self.assertEqual(payload["additional_info"], {"duration_ms": 230000})
 
     def test_stream_recording_id_is_independent_of_the_source_edition(self):
         original = {**recording(STUDIO, "Signal"), "first-release-date": "2001"}
@@ -817,6 +942,9 @@ class MatchTests(unittest.TestCase):
         self.responses[
             "/ws/2/recording?artist:(the act) recording:(signal) alias:(signal)"
         ] = {"recordings": candidates}
+        self.responses[f"/ws/2/recording?recording:(signal) arid:({ARTIST})"] = {
+            "recordings": candidates
+        }
         self.responses[f"watch:{YOUTUBE}"]["tracks"][1].update(
             title="Signal",
             album={"name": "Signal Album (Deluxe Edition)", "id": "fixture-album"},
@@ -853,7 +981,12 @@ class MatchTests(unittest.TestCase):
         )
 
     def test_stream_match_uses_featured_credit_and_full_duration(self):
-        original = recording(STUDIO, "Signal")
+        credits = [
+            CREDITS[0],
+            {**CREDITS[1], "joinphrase": " & "},
+            artist("Second Guest", OTHER),
+        ]
+        original = recording(STUDIO, "Signal", credits)
         mix = recording(EXACT, "Signal", [artist("The Act", ARTIST)], length=237000)
         for rec in (original, mix):
             self.responses[f"/ws/2/recording/{rec['id']}"] = rec
@@ -868,7 +1001,7 @@ class MatchTests(unittest.TestCase):
         matcher = self.matcher()
         spotify_source = {
             "source": "spotify",
-            "title": "Signal (feat. Guest)",
+            "title": "Signal (feat. Guest of an Ensemble and Second Guest)",
             "artist": "The Act",
             "elapsed_ms": 500,
         }
@@ -880,6 +1013,11 @@ class MatchTests(unittest.TestCase):
         }
         self.assertEqual(matcher.match(spotify_source).recording_mbid, STUDIO)
         self.assertEqual(matcher.match(youtube_source).recording_mbid, STUDIO)
+        wrong_feature = {
+            **spotify_source,
+            "title": "Signal (feat. Guest of an Ensemble and Uncredited Performer)",
+        }
+        self.assertEqual(matcher.match(wrong_feature).status, "insufficient_evidence")
 
     def test_stream_uses_exact_album_when_normalized_titles_collide(self):
         intended = recording(STUDIO, "Signal")
@@ -963,6 +1101,23 @@ class MatchTests(unittest.TestCase):
             "recording_mbid",
             result.tags_for(wrong, min_confidence=0, require_song_agreement=True),
         )
+        remaster = {
+            **track,
+            "source": "spotify",
+            "title": "Signal - 2011 Remaster",
+            "artist": "The Act",
+        }
+        result = matcher.match(remaster)
+        tags = spotify.import_tags(
+            remaster, result, listenbrainz.DEFAULT_MIN_CONFIDENCE
+        )
+        self.assertEqual(result.confidence, 1.0)
+        self.assertEqual(tags["recording_mbid"], STUDIO)
+        self.assertEqual(tags["artist"], "The Act feat. Guest")
+
+        live = {**remaster, "title": "Signal (Live at the Arena)"}
+        result = matcher.match(live)
+        self.assertNotIn("recording_mbid", spotify.import_tags(live, result, 0))
         self.responses[f"/ws/2/url?{url}"]["relations"].append(
             {"recording": {"id": EXACT}}
         )

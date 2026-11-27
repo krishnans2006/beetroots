@@ -100,15 +100,23 @@ class MatchResult:
         min_confidence: float,
         require_song_agreement: bool = False,
     ) -> dict:
-        """Apply a sufficiently confident proposal over the source's display tags."""
+        """Use the complete catalog proposal for an accepted recording."""
         tags = {
             key: track[key] for key in ("title", "artist", "album") if track.get(key)
         }
         tags.update(self.provenance.get("source_tags", {}))
         proposal = self.proposed_tags
-        if not proposal or self.confidence is None or self.confidence < min_confidence:
+        if (
+            self.status != "matched"
+            or not self.recording_mbid
+            or not proposal
+            or proposal.get("recording_mbid") != self.recording_mbid
+            or not (proposal.get("title") and proposal.get("artist"))
+            or self.confidence is None
+            or self.confidence < min_confidence
+        ):
             return tags
-        # Video scoring already checks the normalized recording evidence.
+        # Streaming scoring has already corroborated the source recording.
         corroborated = (
             self.recording_mbid
             and self.provenance.get("corroborated_recording") == self.recording_mbid
@@ -153,8 +161,7 @@ class MatchResult:
                 )
             ):
                 return tags
-        tags.update(proposal)
-        return tags
+        return dict(proposal)
 
 
 def validate(track: object) -> str | None:

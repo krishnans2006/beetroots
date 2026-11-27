@@ -4,7 +4,12 @@ import re
 from dataclasses import dataclass
 from typing import Self
 
-from .evidence import display_credit, recording_versions, version_match
+from .evidence import (
+    display_credit,
+    recording_versions,
+    title_qualifiers,
+    version_match,
+)
 from .identity import credit_keys, key
 
 CATALOG_AUDIO = "MUSIC_VIDEO_TYPE_ATV"
@@ -20,7 +25,7 @@ MUSIC_VIDEO_LABEL = re.compile(
     r"[(\[]\s*(?:official\s+(?:music\s+)?video|music video)\s*[)\]]",
     re.IGNORECASE,
 )
-STANDARD_EDITS = {"album version", "single edit"}
+STANDARD_EDITS = frozenset({"album version", "single edit", "radio edit"})
 
 
 def song_title(value: str, artists: tuple[str, ...]) -> str:
@@ -118,13 +123,12 @@ def compatible_version(
         observed_title, observed_disambiguation, distinguish_studio_mix=True
     )
     observed.update(recording_versions(edition_title, distinguish_studio_mix=True))
-    observed -= STANDARD_EDITS - wanted
-    if wanted != observed:
+    if wanted - STANDARD_EDITS != observed - STANDARD_EDITS:
         return False
-    if "mix" in wanted and version:
+    if "mix" in wanted and (mix := version or title_qualifiers(title)):
         return (
-            version_match(version, observed_title, observed_disambiguation) is not False
-            or version_match(version, edition_title, "") is True
+            version_match(mix, observed_title, observed_disambiguation) is True
+            or version_match(mix, edition_title, "") is True
         )
     return True
 

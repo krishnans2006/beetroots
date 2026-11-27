@@ -13,14 +13,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from beetroots import Matcher, MatcherConfig, TrackInput, __version__
-from beetroots.identity import key
 
 if __package__:
     from . import listenbrainz
 else:
     import listenbrainz
 
-DEFAULT_MIN_CONFIDENCE = 0.0
+DEFAULT_MIN_CONFIDENCE = listenbrainz.DEFAULT_MIN_CONFIDENCE
 TRACK_URI = re.compile(r"spotify:track:([A-Za-z0-9]{22})")
 METADATA = {
     "title": ("master_metadata_track_name", "trackName"),
@@ -97,23 +96,9 @@ def spotify_play(row: dict, number: int, include_ip: bool) -> tuple[TrackInput, 
 
 
 def import_tags(track: TrackInput, result, min_confidence: float) -> dict:
-    tags = result.tags_for(
+    return result.tags_for(
         track, min_confidence=min_confidence, require_song_agreement=True
     )
-    if track.get("album") and key(track["album"]) != key(tags.get("album", "")):
-        tags["album"] = track["album"]
-        for field in (
-            "release_mbid",
-            "release_group_mbid",
-            "release_track_mbid",
-            "album_artist",
-            "album_artists",
-            "track_number",
-            "track_number_text",
-            "labels",
-        ):
-            tags.pop(field, None)
-    return tags
 
 
 def listens(rows, matcher, args):

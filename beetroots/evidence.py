@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlsplit
 
@@ -193,10 +194,13 @@ _RECORDING_VERSIONS = {
     "mix": r"\b(?:remix|rework|dub mix|surround mix|dolby atmos|5 1 mix)\b",
     "radio edit": r"\bradio (?:edit|ver(?:sion)?|mix)\b",
     "single edit": r"\bsingle (?:edit|ver(?:sion)?|mix)\b",
-    "album version": r"\balbum (?:edit|ver(?:sion)?|mix)\b",
+    "album version": r"\balbum (?:edit|ver(?:sion)?|mix)\b|\boriginal version\b",
     "long version": r"\b(?:long|extended) (?:edit|ver(?:sion)?|mix)\b",
     "short version": r"\bshort (?:edit|ver(?:sion)?|mix)\b",
-    "alternate": r"\b(?:alternate|alternative|session|sessions) (?:take|mix|version)\b",
+    "alternate": (
+        r"\b(?:alternate|alternative|session|sessions|orchestral) (?:take|mix|version)\b"
+    ),
+    "rerecording": r"\b(?:re ?record(?:ed|ing)|s version)\b",
 }
 
 
@@ -328,6 +332,8 @@ def comparison(
     appearance: Appearance | None,
     credits: list[dict] | None,
     track_number: int | None,
+    *,
+    credited_names: Iterable[str] = (),
 ) -> Distance | None:
     item = item.copy()
     candidate = info.copy()
@@ -340,6 +346,12 @@ def comparison(
         candidate.artist = min(
             (", ".join(names) for names in artist_names),
             key=lambda name: string_dist(item.artist, name),
+        )
+    elif item.artist and credited_names:
+        candidate.artist = min(
+            (name for name in (candidate.artist, *credited_names) if name),
+            key=lambda name: string_dist(item.artist, name),
+            default=candidate.artist,
         )
     if appearance:
         candidate.medium = appearance.medium.get("position")

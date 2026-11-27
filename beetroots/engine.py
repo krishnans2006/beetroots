@@ -26,6 +26,7 @@ from .evidence import (
     provider_fields,
     provider_ids,
     recording_versions,
+    text_key,
     version_evidence,
     version_match,
 )
@@ -33,9 +34,12 @@ from .identity import (
     agrees,
     appearance_names,
     base_title,
+    feature_is_credited,
     featured_artist,
     mastering_label,
+    minor_edit_label,
     names_from_credits,
+    numbered_work,
     recording_title,
 )
 from .identity import (
@@ -44,11 +48,20 @@ from .identity import (
 from .lookups import LookupFailure
 from .metadata import artist_ids, collect_metadata, proposed_tags
 from .schema import MatchIssue, MatchResult, TrackInput
-from .video import VideoEvidence, compatible_version, length_difference
+from .video import (
+    STANDARD_EDITS,
+    VideoEvidence,
+    compatible_version,
+    length_difference,
+    song_title,
+)
 
 # Streaming runtimes can be reported in whole seconds, and release tracks of
 # the same recording can have slightly different amounts of leading silence.
 CLOSE_DURATION = 2
+UNCORROBORATED_DURATION = 5
+MAX_EDIT_DIFFERENCE = 20
+MAX_EDIT_FRACTION = 0.10
 
 
 @dataclass
@@ -71,37 +84,123 @@ def merge_recordings(preferred: dict, fallback: dict) -> dict:
 
 def recording_order(candidate: Candidate) -> tuple:
     date = candidate.recording.get("first-release-date") or ""
-    return not candidate.recording.get("isrcs"), not date, date, candidate.info.track_id
+    title = candidate.recording.get("title") or ""
+    edit = standard_edits(candidate)
+    return (
+        bool(candidate.recording.get("video")),
+        not (
+            candidate.recording.get("isrcs")
+            or date
+            or candidate.recording.get("releases")
+        ),
+        bool(edit - {"album version"}),
+        title != streaming_title(title) and not edit,
+        not candidate.recording.get("isrcs"),
+        not date,
+        date,
+        candidate.info.track_id,
+    )
 
 
-def duplicate_recording(left: Candidate, right: Candidate) -> bool:
-    """Check catalog identity before ignoring differences between editions."""
+def standard_edits(candidate: Candidate) -> set[str]:
+    title = candidate.recording.get("title") or ""
+    notes = candidate.recording.get("disambiguation") or ""
+    edits = recording_versions(title, notes) & STANDARD_EDITS
+    if "early fade" in text_key(f"{title} {notes}"):
+        edits.add("single edit")
+    return edits
+
+
+def recording_description(candidate: Candidate) -> str:
+    notes = (candidate.recording.get("disambiguation") or "").strip().casefold()
     if (
-        bool(left.recording.get("video")) != bool(right.recording.get("video"))
-        or not left.info.length
-        or not right.info.length
-        or abs(left.info.length - right.info.length) > CLOSE_DURATION
+        notes
+        in {
+            "original",
+            "explicit",
+            "studio version",
+            "original studio version",
+            "music video",
+            "official music video",
+        }
+        or mastering_label(notes)
+        or minor_edit_label(
+            notes.removeprefix("studio ").removesuffix(", has early fade")
+        )
+        or (
+            notes.startswith("studio recording from ")
+            and notes.endswith(" performance")
+            and not recording_versions("", notes) - STANDARD_EDITS
+        )
     ):
-        return False
-    title = identity_key(recording_title(left.info.title or ""))
-    credits = set(artist_ids(left.recording))
-    if (
-        not title
-        or title != identity_key(recording_title(right.info.title or ""))
-        or not credits
-        or credits != set(artist_ids(right.recording))
+        return ""
+    return identity_key(notes)
+
+
+def streaming_title(title: str) -> str:
+    return recording_title(song_title(title, ()), minor_edits=True)
+
+
+def recording_family(candidate: Candidate) -> tuple:
+    recording = candidate.recording
+    credits = recording.get("artist-credit") or []
+    artists = artist_ids(recording)
+    title = recording.get("title") or ""
+    feature = featured_artist(title)
+    if feature and feature_is_credited(
+        feature, {identity_key(name) for name in names_from_credits(credits)}
     ):
+        feature = ""
+    return (
+        identity_key(streaming_title(title)),
+        tuple(artists) if len(artists) == len(credits) else (),
+        recording_description(candidate),
+        identity_key(feature),
+    )
+
+
+def edit_tolerance(length: float) -> float:
+    return min(MAX_EDIT_DIFFERENCE, MAX_EDIT_FRACTION * length)
+
+
+def compatible_recordings(left: Candidate, right: Candidate) -> bool:
+    """Accept close catalog duplicates and bounded, explicitly named edits."""
+    family = recording_family(left)
+    if not all(family[:2]) or family != recording_family(right):
         return False
-
-    def description(candidate):
-        notes = candidate.info.trackdisambig or ""
-        return "" if mastering_label(notes) else identity_key(notes)
-
-    if description(left) != description(right):
+    if not left.info.length or not right.info.length:
+        return False
+    same_medium = bool(left.recording.get("video")) == bool(
+        right.recording.get("video")
+    )
+    named_edit = not family[2] and standard_edits(left) != standard_edits(right)
+    difference = abs(left.info.length - right.info.length)
+    maximum = (
+        edit_tolerance(min(left.info.length, right.info.length))
+        if named_edit
+        else CLOSE_DURATION
+    )
+    if difference > maximum or (
+        not same_medium
+        and (
+            family[2]
+            or any(
+                recording_versions(candidate.recording.get("title") or "")
+                - STANDARD_EDITS
+                for candidate in (left, right)
+            )
+        )
+    ):
         return False
     left_isrcs = set(left.recording.get("isrcs") or ())
     right_isrcs = set(right.recording.get("isrcs") or ())
-    if left_isrcs and right_isrcs and left_isrcs.isdisjoint(right_isrcs):
+    if (
+        same_medium
+        and not named_edit
+        and left_isrcs
+        and right_isrcs
+        and left_isrcs.isdisjoint(right_isrcs)
+    ):
         return False
     works = [
         {
@@ -135,6 +234,19 @@ class MatchRun:
     @property
     def streaming(self) -> bool:
         return self.evidence.get("source") == "spotify" or self.video is not None
+
+    @property
+    def infer_standard_recording(self) -> bool:
+        return self.streaming and not any(
+            self.track.get(field) is not None
+            for field in (
+                "release_track_mbid",
+                "version",
+                "disambiguation",
+                *EDITION_FIELDS,
+            )
+            if field != "album"
+        )
 
     def issue(self, path: str, code: str, detail: str) -> None:
         issue = MatchIssue(path=path, code=code, detail=detail)
@@ -431,7 +543,9 @@ class MatchRun:
                     if key == "isrcs":
                         isrcs.extend(value)
                     elif not self.evidence.get(key) and not (
-                        key == "artist_credits" and self.evidence.get("artist")
+                        key == "artist_credits"
+                        and self.evidence.get("artist")
+                        and self.evidence.get("source") != "spotify"
                     ):
                         self.evidence[key] = value
             if metadata:
@@ -862,6 +976,73 @@ class MatchRun:
             for mbid in [*text_order, *sorted(candidates.keys() - set(text_order))]
         ]
 
+    def standard_recording(
+        self, anchor: Candidate, occurrence: Appearance | None
+    ) -> Candidate | None:
+        title = text_key(streaming_title(anchor.recording.get("title") or ""))
+        family_title, artists, _, _ = recording_family(anchor)
+        if not title or not artists:
+            return anchor
+
+        # Use the identified catalog title and artist to give both importers
+        # the same search, independently of their source album and duration.
+        path = "streaming.recording_search"
+        hits = self.lookup(
+            path,
+            self.mb.search,
+            "recording",
+            {"recording": title, "arid": artists[0]},
+            limit=max(15, self.engine.settings.search_limit),
+        )
+        if hits is None:
+            return None
+        candidates = self.resolve_candidates(
+            {
+                mbid: [(path, hit)]
+                for hit in hits
+                if (mbid := hit.get("id"))
+                and MBID.fullmatch(mbid)
+                and (
+                    not hit.get("title")
+                    or family_title == identity_key(streaming_title(hit["title"]))
+                )
+                and (not artist_ids(hit) or artists == tuple(artist_ids(hit)))
+            },
+            {},
+        )
+        source_length = (self.evidence.get("duration_ms") or 0) / 1000
+        if (
+            not source_length
+            and occurrence
+            and edition_match(
+                "album",
+                self.evidence.get("album"),
+                occurrence.release.get("title"),
+                normalize_album=True,
+            )
+        ):
+            source_length = (occurrence.track.get("length") or 0) / 1000
+
+        def compatible(candidate: Candidate) -> bool:
+            if candidate.info.track_id == anchor.info.track_id:
+                return True
+            if not compatible_recordings(anchor, candidate):
+                return False
+            # An edit's representative must also be close to the runtime of a
+            # corroborated source appearance when that length is available.
+            length = candidate.info.length
+            if source_length and abs(anchor.info.length - length) > CLOSE_DURATION:
+                return abs(source_length - length) <= edit_tolerance(
+                    min(source_length, length)
+                )
+            return True
+
+        return min(
+            filter(compatible, candidates),
+            key=recording_order,
+            default=anchor,
+        )
+
     def score(
         self, candidates: list[Candidate], item: Item, titles: list[str]
     ) -> tuple[str, float, Appearance | None] | None:
@@ -1033,7 +1214,6 @@ class MatchRun:
                 }
         if self.video and not linked:
             options = self.video_options(candidates, options, compatible, item, titles)
-        catalog_options = options
         options, identified = self.filter_editions(options, values)
         infer_recording = (
             self.streaming
@@ -1049,7 +1229,7 @@ class MatchRun:
             )
         )
         features = (
-            {identity_key(featured_artist(title)) for title in titles} - {""}
+            {featured_artist(title) for title in titles} - {""}
             if infer_recording
             else set()
         )
@@ -1058,23 +1238,38 @@ class MatchRun:
         )
         scoring_titles = (
             list(
-                dict.fromkeys([*titles, *(recording_title(title) for title in titles)])
+                dict.fromkeys([*titles, *(streaming_title(title) for title in titles)])
             )
-            if infer_recording and (not version or mastering_label(version))
+            if self.streaming
+            and (not version or mastering_label(version) or minor_edit_label(version))
             else titles
         )
         matches = {}
         wanted_versions = recording_versions(titles[0]) if spotify and titles else set()
+        requested_edits = (
+            recording_versions(titles[0], version) & STANDARD_EDITS if titles else set()
+        )
         credits = (
             self.evidence.get("artist_credits")
             if not self.evidence.get("artist")
             else None
         )
+        spotify_credits = self.evidence.get("artist_credits") or []
+        required_credits = (
+            {identity_key(credit["name"]) for credit in spotify_credits}
+            if spotify and len(spotify_credits) > 1
+            else set()
+        )
+        needs_edition = (
+            spotify
+            and linked is None
+            and not item.length
+            and bool(titles)
+            and numbered_work(titles[0])
+        )
         for candidate in candidates:
             mbid = candidate.info.track_id
-            if mbid not in options and not (
-                infer_recording and mbid in catalog_options and mbid in same_song
-            ):
+            if mbid not in options:
                 continue
             observed_versions = (
                 recording_versions(
@@ -1090,12 +1285,13 @@ class MatchRun:
                 else spotify and video
             )
             choices = options.get(mbid, [])
+            catalog_names = [name for name in recording_names(candidate) if name]
+            names = (
+                {identity_key(name) for name in catalog_names} if features else set()
+            )
             missing_feature = bool(
-                infer_recording
-                and features
-                and not features.intersection(
-                    identity_key(name) for name in recording_names(candidate) if name
-                )
+                features
+                and not any(feature_is_credited(feature, names) for feature in features)
             )
             # Prefer positively identified editions when otherwise tied.
             choices = sorted(
@@ -1114,18 +1310,27 @@ class MatchRun:
                 song_agrees = mbid in same_song or (
                     selected is not None and selected.track_id in agreeing_tracks
                 )
+                album_matches = selected is not None and edition_match(
+                    "album",
+                    item.album,
+                    selected.release.get("title"),
+                    normalize_album=True,
+                )
+                unmatched_album = bool(
+                    self.streaming and item.album and not album_matches
+                )
+                compare_credit = self.streaming and candidate is linked and song_agrees
+                credited_names = catalog_names
+                if album_matches and (required_credits or compare_credit):
+                    credited_names = [
+                        *catalog_names,
+                        *appearance_names(selected.track, selected.release),
+                    ]
                 difference = None
                 missing_duration = False
-                unmatched_album = False
-                if (infer_recording and item.length) or (
+                if (self.streaming and item.length) or (
                     self.video and candidate is not linked
                 ):
-                    album_matches = selected and edition_match(
-                        "album",
-                        item.album,
-                        selected.release.get("title"),
-                        normalize_album=True,
-                    )
                     difference = length_difference(
                         item.length,
                         candidate.info.length,
@@ -1134,18 +1339,58 @@ class MatchRun:
                         else None,
                     )
                     missing_duration = bool(item.length and difference is None)
-                    unmatched_album = bool(
-                        self.video and item.album and not album_matches
-                    )
                 versions = observed_versions
                 if spotify and selected:
                     versions = versions | recording_versions(
                         selected.track.get("title") or ""
                     )
+                if self.streaming:
+                    if candidate is not linked and (
+                        not song_agrees
+                        or missing_feature
+                        or (needs_edition and not album_matches)
+                        or (
+                            wrong_medium
+                            and (
+                                spotify
+                                or (self.video and self.video.preferred_video is False)
+                            )
+                        )
+                    ):
+                        continue
+                    if required_credits and not required_credits.issubset(
+                        identity_key(name) for name in credited_names
+                    ):
+                        continue
+                    if spotify and titles:
+                        edition_title = (
+                            selected.track.get("title") or "" if album_matches else ""
+                        )
+                        exact_studio_title = text_key(version) == "studio version" and (
+                            identity_key(titles[0])
+                            == identity_key(edition_title)
+                            == identity_key(candidate.info.title or "")
+                        )
+                        if not exact_studio_title and not compatible_version(
+                            titles[0],
+                            version,
+                            candidate.info.title or "",
+                            candidate.info.trackdisambig or "",
+                            edition_title,
+                        ):
+                            continue
+                    if difference is not None:
+                        tolerance = get_track_length_grace()
+                        if candidate is not linked and not album_matches:
+                            tolerance = min(tolerance, UNCORROBORATED_DURATION)
+                        if requested_edits or standard_edits(candidate):
+                            tolerance = max(tolerance, edit_tolerance(item.length))
+                        if difference > tolerance:
+                            continue
                 if not wanted_versions:
                     # A plain title can refer to the standard album or single
                     # cut. Keep those when considering a named mix or take.
-                    versions = versions - {"album version", "single edit"}
+                    versions = versions - STANDARD_EDITS
                 variant = int(wanted_versions != versions)
                 if (
                     wanted_versions
@@ -1160,6 +1405,7 @@ class MatchRun:
                     appearance,
                     credits,
                     self.evidence.get("track_number"),
+                    credited_names=credited_names if compare_credit else (),
                 )
                 if distance is not None:
                     rank = (
@@ -1167,7 +1413,6 @@ class MatchRun:
                             not song_agrees,
                             wrong_medium,
                             variant,
-                            missing_feature,
                             infer_recording
                             and difference is not None
                             and difference > CLOSE_DURATION,
@@ -1179,34 +1424,21 @@ class MatchRun:
                     )
                     if mbid not in matches or rank < matches[mbid][0]:
                         matches[mbid] = (rank, candidate, selected)
-        best = min(
-            (match for mbid, match in matches.items() if mbid in options),
-            key=lambda match: match[0],
-            default=None,
-        )
+        best = min(matches.values(), key=lambda match: match[0], default=None)
         if best is None:
             return None
         rank, winner, selected = best
         if (
-            infer_recording
-            and titles
-            and winner.info.track_id in same_song
-            and (not version or mastering_label(version))
-            and not any(recording_versions(title) for title in titles)
-        ):
-            # Sound-alike duplicates can be attached to different tracklists.
-            # Once beets has found the song, prefer a stable catalog entry
-            # among those that fit the same recording evidence.
-            rank, winner, selected = min(
-                (
-                    match
-                    for mbid, match in matches.items()
-                    if mbid in same_song
-                    and match[0][0] <= rank[0]
-                    and (match is best or duplicate_recording(winner, match[1]))
-                ),
-                key=lambda match: recording_order(match[1]),
+            self.streaming
+            and linked is None
+            and any(
+                alternative[0] == rank
+                and not compatible_recordings(winner, alternative[1])
+                for alternative in matches.values()
+                if alternative is not best
             )
+        ):
+            return None
         *_, distance, _ = rank
         self.provenance["candidate_paths"] = sorted(winner.paths)
         if winner is linked:
@@ -1271,7 +1503,13 @@ class MatchRun:
                 if difference is None:
                     if item.length and not edition:
                         continue
-                elif difference > grace:
+                elif difference > max(
+                    grace,
+                    edit_tolerance(item.length)
+                    if standard_edits(candidate)
+                    or recording_versions(titles[0]) & STANDARD_EDITS
+                    else 0,
+                ):
                     continue
                 eligible[mbid] = valid_appearances
                 if appearance:
@@ -1290,7 +1528,7 @@ class MatchRun:
         if not (recording := self.entity("recording", mbid)):
             return self.result("lookup_error", **identity)
         identity["recording_mbid"] = recording["id"]
-        if self.video and method == "metadata":
+        if self.streaming and method == "metadata":
             self.provenance["corroborated_recording"] = recording["id"]
         self.aliases[mbid] = recording["id"]
         collected = self.lookup("metadata", collect_metadata, self, recording, selected)
@@ -1395,7 +1633,14 @@ class MatchRun:
         )
         search_titles = list(
             dict.fromkeys(
-                term for title in titles for term in (title, base_title(title)) if term
+                term
+                for title in titles
+                for term in (
+                    title,
+                    base_title(title),
+                    streaming_title(title) if self.streaming else title,
+                )
+                if term
             )
         )
         candidates = self.find_candidates(Source.from_item(item), search_titles)
@@ -1448,6 +1693,17 @@ class MatchRun:
         if selected is None:
             return self.result("insufficient_evidence")
         mbid, distance, occurrence = selected
+        if self.infer_standard_recording:
+            anchor = next(
+                candidate for candidate in candidates if candidate.info.track_id == mbid
+            )
+            standard = self.standard_recording(anchor, occurrence)
+            if standard is None:
+                return self.result("lookup_error")
+            if standard.info.track_id != mbid:
+                self.provenance["source_recording_mbid"] = mbid
+                mbid = standard.info.track_id
+            occurrence = None
         return self.finish(mbid, "metadata", distance, occurrence)
 
 

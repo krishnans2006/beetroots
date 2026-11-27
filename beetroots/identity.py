@@ -19,7 +19,13 @@ _VERSION = re.compile(
 _CREDIT = re.compile(r"\b(?:feat\.?|ft\.?|featuring|with|from)\s+", re.IGNORECASE)
 _FEATURE_SUFFIX = re.compile(r"\s+(?:feat\.|ft\.|featuring)\s+.+$", re.IGNORECASE)
 _FEATURE = re.compile(r"(?:feat\.?|ft\.?|featuring)\s+(.+)", re.IGNORECASE)
+_FEATURE_JOIN = re.compile(r"\s*(?:,|&|\band\b)\s*", re.IGNORECASE)
+_AFFILIATION = re.compile(r"\s+of\s+", re.IGNORECASE)
 _MASTERING = r"(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?"
+_MINOR_EDIT = re.compile(
+    r"(?:(?:album|single|radio)\s+(?:edit|version|ver\.?)|original version|early fade)",
+    re.IGNORECASE,
+)
 _ALBUM_EDITION = re.compile(
     rf"(?:{_MASTERING}|(?:deluxe|expanded|(?:\d+(?:st|nd|rd|th)\s+)?anniversary)"
     rf"(?:\s+re-?mastered)?)(?:\s+edition)?",
@@ -31,6 +37,10 @@ _APOSTROPHES = str.maketrans("", "", "ʻʼʹꞌ")
 _OPUS = re.compile(r"\bop\.?\s*\d+", re.IGNORECASE)
 _CATALOG_NUMBER = re.compile(
     r",?\s+\b(?:B|D|H|K|KV|RV|BWV|WoO)\.?\s*\d+[a-z]?\b",
+    re.IGNORECASE,
+)
+_NUMBERED_WORK = re.compile(
+    r"\b(?:symphony|concerto|sonata|quartet|suite)\s+(?:no\.?\s*)?\d+\b",
     re.IGNORECASE,
 )
 
@@ -72,16 +82,37 @@ def featured_artist(title: str) -> str:
     return ""
 
 
+def feature_is_credited(feature: str, names: set[str]) -> bool:
+    def credited(value: str) -> bool:
+        # The source may append a credited performer's group as an affiliation.
+        return (
+            key(value) in names
+            or key(_AFFILIATION.split(value, maxsplit=1)[0]) in names
+        )
+
+    return key(feature) in names or all(
+        credited(name) for name in _FEATURE_JOIN.split(feature)
+    )
+
+
 def mastering_label(text: str) -> bool:
     return bool(re.fullmatch(_MASTERING, text.strip(), re.IGNORECASE))
 
 
-def recording_title(title: str) -> str:
+def minor_edit_label(text: str) -> bool:
+    return bool(_MINOR_EDIT.fullmatch(text.strip()))
+
+
+def recording_title(title: str, *, minor_edits: bool = False) -> str:
     """Match catalog titles while retaining audible version qualifiers."""
     title = title.strip()
     while match := _BRACKET_SUFFIX.search(title) or _DASH_SUFFIX.search(title):
         suffix = match[1].strip()
-        if not (mastering_label(suffix) or _FEATURE.fullmatch(suffix)):
+        if not (
+            mastering_label(suffix)
+            or _FEATURE.fullmatch(suffix)
+            or (minor_edits and minor_edit_label(suffix))
+        ):
             break
         title = title[: match.start()].rstrip()
     return _FEATURE_SUFFIX.sub("", title)
@@ -125,6 +156,14 @@ def same_title(left: str, right: str, source_artist: str, names: list[str]) -> b
     return one_catalog and bool(
         title_keys(_CATALOG_NUMBER.sub("", left), [source_artist])
         & title_keys(_CATALOG_NUMBER.sub("", right), names)
+    )
+
+
+def numbered_work(title: str) -> bool:
+    return bool(
+        _OPUS.search(title)
+        or _CATALOG_NUMBER.search(title)
+        or _NUMBERED_WORK.search(title)
     )
 
 

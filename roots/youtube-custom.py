@@ -140,7 +140,7 @@ def main() -> int:
     parser.add_argument(
         "--min-confidence",
         type=float,
-        default=0.0,
+        default=listenbrainz.DEFAULT_MIN_CONFIDENCE,
         help="minimum confidence for applying proposed tags (default: %(default)s)",
     )
     parser.add_argument("--config", type=Path, help="Beetroots MatcherConfig JSON file")

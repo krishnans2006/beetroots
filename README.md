@@ -44,7 +44,7 @@ beetroots match --config matcher.json --cache lookups.sqlite3 --refresh < listen
 - Supply ordered `artist_credits` as objects with `name`, optional `join_phrase`, and optional `artist_mbid`. The `artist` field takes a display string. Use `duration_ms` for the full track length and `elapsed_ms` for playback progress.
 - Spotify track IDs, URIs, and URLs use client credentials from `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` or the equivalent `MatcherConfig` fields. YouTube enrichment uses unauthenticated YouTube Music by default.
 - For a YouTube upload, pass its display label as `video_title` and its channel name as `uploader`. Use `title` and `artist` for independently known song metadata. This lets Beetroots distinguish official catalog credits and corroborated video links from uploader names.
-- Results include the input and provider evidence in `provenance`. The `metadata` field holds the canonical recording, linked MusicBrainz payloads, and verified release-track appearances. The `edition` field identifies the appearance used for `proposed_tags` and whether it was inferred. The caller can save the result and decide when to apply the proposed tags.
+- Results include the input and provider evidence in `provenance`. The `metadata` field holds the canonical recording, linked MusicBrainz payloads, and verified release-track appearances. The `edition` field identifies the appearance used for `proposed_tags` and whether it was inferred. Use `result.tags_for(listen, min_confidence=0.68)` to apply the catalog proposal as a unit or fall back to source tags when the result is rejected.
 - A scored match has `confidence = 1 - distance`, including zero-confidence matches. An unverified, unscorable input has null confidence and null proposed tags. Lookup failures appear in `issues`. When a failure leaves some canonical metadata unavailable, `metadata.complete` is false.
 
 ## Configure and replay
@@ -78,7 +78,11 @@ python -m roots.spotify data/Streaming_History_Audio_2020.json \
   --submit http://localhost:4110/apis/listenbrainz/1
 ```
 
-The wrapper accepts Spotify’s extended and basic history formats. It estimates playback start from the exported end time and sends elapsed playback as `duration_played_ms`. Full track duration comes from Beetroots. Beetroots checks title and credit agreement against the recording and verified appearances on the source album. An agreeing title or recording alias can corroborate a unique active Spotify recording link or an unambiguous ISRC lookup. The importer prefers compatible audio versions and keeps the source album name when the proposed recording comes from a differently named release. Title comparison accepts equivalent punctuation and preserves work and movement numbers. Spotify text supplies missing fields and covers rejected or unmatched results. The default confidence floor is **0.0**. Use `--min-confidence` to raise it while retaining the title and credit check. [Spotify export fields](https://support.spotify.com/us/article/understanding-your-data/) · [ListenBrainz request fields](https://listenbrainz.readthedocs.io/en/latest/users/json.html)
+The wrapper accepts Spotify’s extended and basic history formats. It estimates playback start from the exported end time and sends elapsed playback as `duration_played_ms`. Beetroots checks title and credit agreement against the recording and verified appearances on the source album. An agreeing title or recording alias can corroborate a unique active Spotify recording link or an unambiguous ISRC lookup. Title comparison accepts equivalent punctuation and preserves work and movement numbers. [Spotify export fields](https://support.spotify.com/us/article/understanding-your-data/) · [ListenBrainz request fields](https://listenbrainz.readthedocs.io/en/latest/users/json.html)
+
+Both streaming importers use a confidence floor of **0.68** by default. When they accept an MBID, the title, credits, release, and full duration in the scrobble come from MusicBrainz. Unavailable catalog fields are omitted. When the match is rejected or unresolved, the importers send the available source metadata so the server can try to identify the recording. Use `--min-confidence` to adjust the floor.
+
+After identifying the song, both importers look for a shared recording by MusicBrainz title and artist. They prefer a standard audio recording when a nearby radio, single, or album edit has compatible catalog credits and duration. Distinct performances and mixes are evaluated separately. An inferred recording uses a consistent catalog release appearance across the importers.
 
 Podcasts, audiobooks, zero-playback rows, and malformed entries are skipped. Positive short plays are kept. Add `--include-incognito` to include private-session listens and `--include-ip` to carry IP addresses in the Spotify-specific request metadata. The demo Koito build accepts this context in the request and stores a subset of the submitted fields. The wrapper reports counts and errors on stderr.
 
@@ -88,7 +92,7 @@ Use `--start-row` and `--limit` to select a one-based range of source rows. In s
 
 The five exports were run through the wrapper against a local replay of the [November 17, 2026 canonical MusicBrainz snapshot](https://metabrainz.org/datasets/derived-dumps). Read-only indexed MusicBrainz searches and a second pass over disputed results supplied additional evidence. The replay validates the wrapper and Beetroots against a fixed catalog. Live search ordering and full release metadata can vary.
 
-The old cutoff of 0.68 let an exact artist credit carry a different song title above the threshold. It also discarded valid ensemble credits that Spotify shortened to one artist. The importer now checks the title and credit separately before applying an MBID. The matcher also searches the credited artist individually when its ordinary search returns no same-song result. With the agreement check in place, raising the numeric cutoff dropped verified songs without removing any additional observed wrong-song tags in the replay.
+An earlier matcher let an exact artist credit carry a different song title above the confidence floor. It also discarded valid ensemble credits that Spotify shortened to one artist. The importer checks title, credit, and version evidence before applying an MBID. The matcher also searches the credited artist individually when its ordinary search returns no same-song result.
 
 ## Import custom YouTube Music history
 
@@ -117,8 +121,8 @@ title on stderr.
 
 Beetroots uses exact MusicBrainz streaming links when they identify a single
 recording. Otherwise it checks the available title, credit, version and duration
-evidence and uses beets for candidate search and ranking. Use
-`--min-confidence` to raise the default confidence floor of 0.0. Use
+evidence and uses beets for candidate search and ranking. The confidence and
+catalog tagging rules are shared with the Spotify importer. Use
 `--start-row`, `--limit` and `--batch-size` to control the import range and
 batches. `--config` and `--cache` work as they do for Spotify. A full import with
 a cold cache can take hours because MusicBrainz requests are rate limited.
